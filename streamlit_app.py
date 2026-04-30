@@ -15,7 +15,8 @@ st.caption("NSE stock ranking pipeline (EOD) — ingest → features/labels → 
 with st.sidebar:
     st.header("Broker")
     broker = st.selectbox("Select broker", ["mock", "yahoo", "zerodha", "upstox", "angelone"])
-    st.write("Credentials are read from environment variables (recommended).")
+    creds_file = st.text_input("Credentials file (YAML)", "credentials.yaml")
+    st.caption("Create `credentials.yaml` from `credentials.example.yaml` (it is gitignored).")
 
     st.header("Data")
     data_root = st.text_input("data root", "data")
@@ -64,7 +65,7 @@ with col1:
         extra = f" --symbols-file {symbols_file}" if symbols_file else ""
         _run(
             f"python -m stock_knight.cli ingest --broker {broker} --data-root {data_root} "
-            f"--start {start} --end {end}{extra}"
+            f"--start {start} --end {end} --creds-file {creds_file}{extra}"
         )
         st.success("Ingest complete.")
 
@@ -101,10 +102,7 @@ st.divider()
 st.subheader("Notes")
 st.markdown(
     """
-- For real brokers (Zerodha/Upstox/Angel One), set credentials as environment variables:
-  - Zerodha: `ZERODHA_API_KEY`, `ZERODHA_ACCESS_TOKEN`
-  - Upstox: `UPSTOX_ACCESS_TOKEN`
-  - Angel One: `ANGELONE_API_KEY`, `ANGELONE_CLIENT_CODE`, `ANGELONE_PASSWORD`, `ANGELONE_TOTP`
+- Credentials can be stored in `credentials.yaml` (recommended) or environment variables as fallback.
 - Install extra deps:
   - `pip install -e '.[brokers,ui]'`
 """

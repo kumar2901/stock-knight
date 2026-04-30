@@ -18,10 +18,12 @@ from stock_knight.ranking.daily import rank_for_date, write_ranklists
 from stock_knight.monitoring.drift import drift_report_from_scores, write_drift_report
 from stock_knight.train.fit import train_walk_forward
 from stock_knight.train.models import load_model
+from stock_knight.credentials import load_credentials
  
  
-def _get_broker_client(name: str):
+def _get_broker_client(name: str, creds: dict | None = None):
     name = name.lower()
+    creds = creds or {}
     if name == "mock":
         from stock_knight.brokers.mock import MockBrokerEODClient
 
@@ -35,11 +37,13 @@ def _get_broker_client(name: str):
 
         from stock_knight.brokers.zerodha import ZerodhaConfig, ZerodhaKiteEODClient
 
-        api_key = os.environ.get("ZERODHA_API_KEY")
-        access_token = os.environ.get("ZERODHA_ACCESS_TOKEN")
+        z = creds.get("zerodha", {}) if isinstance(creds, dict) else {}
+        api_key = z.get("api_key") or os.environ.get("ZERODHA_API_KEY")
+        access_token = z.get("access_token") or os.environ.get("ZERODHA_ACCESS_TOKEN")
         if not api_key or not access_token:
             raise ValueError(
-                "Missing Zerodha credentials. Set env vars: ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN."
+                "Missing Zerodha credentials. Provide --creds-file with zerodha.api_key/access_token "
+                "or set env vars: ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN."
             )
         return ZerodhaKiteEODClient(ZerodhaConfig(api_key=api_key, access_token=access_token))
     if name == "upstox":
@@ -47,23 +51,28 @@ def _get_broker_client(name: str):
 
         from stock_knight.brokers.upstox import UpstoxConfig, UpstoxEODClient
 
-        access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+        u = creds.get("upstox", {}) if isinstance(creds, dict) else {}
+        access_token = u.get("access_token") or os.environ.get("UPSTOX_ACCESS_TOKEN")
         if not access_token:
-            raise ValueError("Missing Upstox credentials. Set env var: UPSTOX_ACCESS_TOKEN.")
+            raise ValueError(
+                "Missing Upstox credentials. Provide --creds-file with upstox.access_token "
+                "or set env var: UPSTOX_ACCESS_TOKEN."
+            )
         return UpstoxEODClient(UpstoxConfig(access_token=access_token))
     if name in {"angelone", "angel"}:
         import os
 
         from stock_knight.brokers.angelone import AngelOneConfig, AngelOneSmartApiEODClient
 
-        api_key = os.environ.get("ANGELONE_API_KEY")
-        client_code = os.environ.get("ANGELONE_CLIENT_CODE")
-        password = os.environ.get("ANGELONE_PASSWORD")
-        totp = os.environ.get("ANGELONE_TOTP")
+        a = creds.get("angelone", {}) if isinstance(creds, dict) else {}
+        api_key = a.get("api_key") or os.environ.get("ANGELONE_API_KEY")
+        client_code = a.get("client_code") or os.environ.get("ANGELONE_CLIENT_CODE")
+        password = a.get("password") or os.environ.get("ANGELONE_PASSWORD")
+        totp = a.get("totp") or os.environ.get("ANGELONE_TOTP")
         if not (api_key and client_code and password and totp):
             raise ValueError(
-                "Missing Angel One credentials. Set env vars: "
-                "ANGELONE_API_KEY, ANGELONE_CLIENT_CODE, ANGELONE_PASSWORD, ANGELONE_TOTP."
+                "Missing Angel One credentials. Provide --creds-file with angelone.* "
+                "or set env vars: ANGELONE_API_KEY, ANGELONE_CLIENT_CODE, ANGELONE_PASSWORD, ANGELONE_TOTP."
             )
         return AngelOneSmartApiEODClient(
             AngelOneConfig(api_key=api_key, client_code=client_code, password=password, totp=totp)
@@ -72,50 +81,51 @@ def _get_broker_client(name: str):
  
  
 def cmd_ingest(args: argparse.Namespace) -> None:
-     console = Console()
-     cfg: ProjectConfig = default_config()
-     root = Path(args.data_root)
-     paths = DataPaths(root=root)
-     ensure_dirs(paths.ohlcv, paths.corporate_actions, paths.universe)
- 
-    broker = _get_broker_client(args.broker)
+    console = Console()
+    cfg: ProjectConfig = default_config()
+    root = Path(args.data_root)
+    paths = DataPaths(root=root)
+    ensure_dirs(paths.ohlcv, paths.corporate_actions, paths.universe)
+
+    creds = load_credentials(args.creds_file)
+    broker = _get_broker_client(args.broker, creds=creds)
     if args.symbols_file:
         symbols = [s.strip() for s in Path(args.symbols_file).read_text().splitlines() if s.strip()]
     else:
         symbols = broker.list_symbols().symbols
-     start = pd.Timestamp(args.start)
-     end = pd.Timestamp(args.end)
+    start = pd.Timestamp(args.start)
+    end = pd.Timestamp(args.end)
+
+    console.print(f"Fetching EOD OHLCV for {len(symbols)} symbols from {start} to {end}...")
+    ohlcv = broker.fetch_ohlcv(symbols=symbols, start=start, end=end)
  
-     console.print(f"Fetching EOD OHLCV for {len(symbols)} symbols from {start} to {end}...")
-     ohlcv = broker.fetch_ohlcv(symbols=symbols, start=start, end=end)
- 
-     qa = qa_ohlcv_frame(ohlcv)
-     if not qa.ok:
-         console.print("[red]QA failed[/red]")
-         for issue in qa.issues:
-             console.print(f"- {issue}")
-         raise SystemExit(2)
- 
-     # Placeholder: corporate action factors not wired yet (pass None)
-     ohlcv_adj = apply_price_adjustments(ohlcv, factors=None)
- 
-     out = paths.ohlcv / f"ohlcv_{start.date()}_{end.date()}.parquet"
-     write_df_parquet(out, ohlcv_adj)
-     console.print(f"Wrote {out}")
- 
-     # Universe snapshot (liquidity rule) for end date
-     snap = universe_by_liquidity_rule(
-         ohlcv=ohlcv_adj,
-         asof=end,
-         lookback_days=cfg.universe.lookback_days,
-         preselect_top_n=cfg.universe.preselect_top_n,
-         final_top_n=cfg.universe.final_top_n,
-         min_price=cfg.universe.min_price,
-         min_traded_value_inr=cfg.universe.min_traded_value_inr,
-     )
-     uout = paths.universe / f"universe_{pd.Timestamp(snap.asof).date()}.json"
-     write_json(uout, {"asof": str(snap.asof), "symbols": snap.symbols})
-     console.print(f"Wrote {uout} (n={len(snap.symbols)})")
+    qa = qa_ohlcv_frame(ohlcv)
+    if not qa.ok:
+        console.print("[red]QA failed[/red]")
+        for issue in qa.issues:
+            console.print(f"- {issue}")
+        raise SystemExit(2)
+
+    # Placeholder: corporate action factors not wired yet (pass None)
+    ohlcv_adj = apply_price_adjustments(ohlcv, factors=None)
+
+    out = paths.ohlcv / f"ohlcv_{start.date()}_{end.date()}.parquet"
+    write_df_parquet(out, ohlcv_adj)
+    console.print(f"Wrote {out}")
+
+    # Universe snapshot (liquidity rule) for end date
+    snap = universe_by_liquidity_rule(
+        ohlcv=ohlcv_adj,
+        asof=end,
+        lookback_days=cfg.universe.lookback_days,
+        preselect_top_n=cfg.universe.preselect_top_n,
+        final_top_n=cfg.universe.final_top_n,
+        min_price=cfg.universe.min_price,
+        min_traded_value_inr=cfg.universe.min_traded_value_inr,
+    )
+    uout = paths.universe / f"universe_{pd.Timestamp(snap.asof).date()}.json"
+    write_json(uout, {"asof": str(snap.asof), "symbols": snap.symbols})
+    console.print(f"Wrote {uout} (n={len(snap.symbols)})")
  
  
 def build_parser() -> argparse.ArgumentParser:
@@ -127,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--data-root", default="data", help="Root directory for data storage")
     ingest.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
     ingest.add_argument("--end", required=True, help="End date YYYY-MM-DD")
+    ingest.add_argument(
+        "--creds-file",
+        default=None,
+        help="Path to YAML credentials file (recommended). Example template: credentials.example.yaml",
+    )
     ingest.add_argument(
         "--symbols-file",
         default=None,

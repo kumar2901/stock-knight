@@ -13,4 +13,9 @@ __pycache__/
 data/
 artifacts/
 reports/
+
+# Credentials / secrets
+credentials.yaml
+credentials.*.yaml
+.env
  

@@ -174,7 +174,64 @@ python -m stock_knight.cli drift \
 ```
 
 ### 3) Running with real broker data (next step)
-Replace `--broker mock` by implementing a real `BrokerEODClient` in `src/stock_knight/brokers/` and wiring it in `stock_knight/cli.py`.
+Install broker + UI dependencies:
+
+```bash
+pip install -e '.[brokers,ui]'
+```
+
+Then select a broker via `--broker`:
+- `mock` (synthetic dev data)
+- `yahoo` (Yahoo Finance via `yfinance`; provide symbols like `RELIANCE.NS`)
+- `zerodha` (Kite Connect; provide NSE tradingsymbols like `RELIANCE`)
+- `upstox` (provide instrument_keys; see note below)
+- `angelone` (provide symboltokens; see note below)
+
+Because most real broker APIs require **instrument identifiers** (tokens/keys), the recommended workflow is to pass a symbol list file:
+
+```bash
+python -m stock_knight.cli ingest --broker yahoo --symbols-file symbols.txt --start 2023-01-01 --end 2025-12-31
+```
+
+#### Credentials (environment variables)
+- **Zerodha**: `ZERODHA_API_KEY`, `ZERODHA_ACCESS_TOKEN`
+- **Upstox**: `UPSTOX_ACCESS_TOKEN`
+- **Angel One**: `ANGELONE_API_KEY`, `ANGELONE_CLIENT_CODE`, `ANGELONE_PASSWORD`, `ANGELONE_TOTP`
+
+#### Credentials (external file, recommended)
+1. Copy the template:
+
+```bash
+cp credentials.example.yaml credentials.yaml
+```
+
+2. Fill in your keys in `credentials.yaml` (this file is **gitignored**).
+
+3. (Zerodha) Generate a fresh access token (interactive login, once per day).
+
+Recommended (works with any redirect URL): manual mode (paste `request_token`):
+
+```bash
+python -m stock_knight.auth.zerodha_login --creds-file credentials.yaml --mode manual
+```
+
+Alternative: server mode (requires setting Zerodha app redirect URL to `http://127.0.0.1:8787/`):
+
+```bash
+python -m stock_knight.auth.zerodha_login --creds-file credentials.yaml --mode server --host 127.0.0.1 --port 8787
+```
+
+3. Run ingest with:
+
+```bash
+python -m stock_knight.cli ingest --broker zerodha --creds-file credentials.yaml --symbols-file symbols.txt --start 2023-01-01 --end 2025-12-31
+```
+
+#### Streamlit UI
+
+```bash
+streamlit run streamlit_app.py
+```
 
 Create a virtualenv and install:
 

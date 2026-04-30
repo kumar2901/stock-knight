@@ -10,5 +10,14 @@ pyyaml
 matplotlib
 rich
 
+[brokers]
+yfinance
+kiteconnect
+upstox-python-sdk
+smartapi-python
+
 [dev]
 ruff
+
+[ui]
+streamlit
