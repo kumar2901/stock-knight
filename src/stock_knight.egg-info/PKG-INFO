@@ -1,0 +1,41 @@
+Metadata-Version: 2.4
+Name: stock-knight
+Version: 0.1.0
+Summary: NSE stock ranking models (top-k lists) with walk-forward training and cost-aware backtests.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: pyarrow
+Requires-Dist: scikit-learn
+Requires-Dist: lightgbm
+Requires-Dist: xgboost
+Requires-Dist: tqdm
+Requires-Dist: pydantic>=2
+Requires-Dist: pyyaml
+Requires-Dist: matplotlib
+Requires-Dist: rich
+Provides-Extra: dev
+Requires-Dist: ruff; extra == "dev"
+
+# stock-knight
+
+NSE stock **ranking** system that outputs **Top 10/20/30** candidates for multiple horizons (1D, 7D, 1M, 6M, 12M), with walk-forward training and cost-aware backtests.
+
+## Quickstart (dev)
+
+Create a virtualenv and install:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+Run an end-to-end *ingestion + universe snapshot* using synthetic data:
+
+```bash
+python -m stock_knight.cli ingest --broker mock --start 2024-01-01 --end 2024-06-30
+```
+
+This writes data into `data/` (parquet + json).

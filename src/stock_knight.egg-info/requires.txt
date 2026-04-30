@@ -1,0 +1,14 @@
+numpy
+pandas
+pyarrow
+scikit-learn
+lightgbm
+xgboost
+tqdm
+pydantic>=2
+pyyaml
+matplotlib
+rich
+
+[dev]
+ruff

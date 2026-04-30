@@ -1,0 +1,46 @@
+ [project]
+ name = "stock-knight"
+ version = "0.1.0"
+ description = "NSE stock ranking models (top-k lists) with walk-forward training and cost-aware backtests."
+ readme = "README.md"
+ requires-python = ">=3.11"
+ dependencies = [
+   "numpy",
+   "pandas",
+   "pyarrow",
+   "scikit-learn",
+   "lightgbm",
+   "xgboost",
+   "tqdm",
+   "pydantic>=2",
+   "pyyaml",
+   "matplotlib",
+   "rich",
+ ]
+ 
+ [project.optional-dependencies]
+ dev = [
+   "ruff",
+ ]
+
+brokers = [
+  "yfinance",
+  "kiteconnect",
+  "upstox-python-sdk",
+  "smartapi-python",
+]
+
+ui = [
+  "streamlit",
+]
+ 
+ [tool.ruff]
+ line-length = 100
+ target-version = "py311"
+ 
+ [tool.ruff.lint]
+ select = ["E", "F", "I", "UP", "B"]
+ 
+ [tool.ruff.lint.isort]
+ combine-as-imports = true
+ 
