@@ -28,6 +28,8 @@ brokers = [
   "kiteconnect",
   "upstox-python-sdk",
   "smartapi-python",
+  "logzero",
+  "pyotp",
 ]
 
 ui = [

@@ -11,6 +11,7 @@ src/stock_knight.egg-info/SOURCES.txt
 src/stock_knight.egg-info/dependency_links.txt
 src/stock_knight.egg-info/requires.txt
 src/stock_knight.egg-info/top_level.txt
+src/stock_knight/auth/angelone_login.py
 src/stock_knight/auth/zerodha_login.py
 src/stock_knight/backtest/costs.py
 src/stock_knight/backtest/metrics.py
@@ -25,6 +26,9 @@ src/stock_knight/brokers/zerodha.py
 src/stock_knight/data/corporate_actions.py
 src/stock_knight/data/qa.py
 src/stock_knight/data/universe.py
+src/stock_knight/execution/__init__.py
+src/stock_knight/execution/angelone_trader.py
+src/stock_knight/execution/zerodha_trader.py
 src/stock_knight/features/price_features.py
 src/stock_knight/monitoring/drift.py
 src/stock_knight/pipeline/features_labels.py

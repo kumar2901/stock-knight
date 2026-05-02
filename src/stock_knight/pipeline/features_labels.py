@@ -1,17 +1,62 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import pandas as pd
 
 from stock_knight.features.price_features import compute_price_features
-from stock_knight.labels import Horizons, make_forward_returns
+from stock_knight.labels import Horizons, make_excess_returns, make_forward_returns
 from stock_knight.storage import DataPaths, read_df_parquet, write_df_parquet
+
+# Map of known-bad / delisted Yahoo Finance tickers → verified working replacement.
+# Tested live 2026-05: ^CNX500, ^NIFTYBANK, ^CNXMIDCAP* are all 404 on Yahoo.
+_TICKER_ALIASES: dict[str, str] = {
+    "^CNXMIDCAP":    "^NSMIDCP",
+    "^CNXMIDCAP100": "^NSMIDCP",
+    "^NSMIDCP100":   "^NSMIDCP",
+    "^NSMIDCP50":    "^NSMIDCP",
+    "^CNXSMALLCAP":  "^NSEI",
+    "^CNX500":       "^NSEI",
+    "^NIFTYBANK":    "^NSEI",
+    "^CNXIT":        "^NSEI",
+}
+
+# Verified working Yahoo Finance benchmark tickers (tested 2026-05)
+_VALID_BENCHMARKS = ["^NSEI", "^CNX100", "^CNX200", "^NSMIDCP", "^BSESN"]
+
+
+def _auto_fetch_benchmark(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame | None:
+    """Try to download benchmark OHLCV from Yahoo Finance and return in standard format."""
+    try:
+        import yfinance as yf  # type: ignore[import]
+    except ImportError:
+        return None
+    try:
+        raw = yf.download(symbol, start=start, end=end + pd.Timedelta(days=1),
+                          progress=False, auto_adjust=True)
+        if raw.empty:
+            return None
+        # Flatten multi-level columns if needed
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        raw = raw.reset_index()
+        raw.columns = [c.lower() for c in raw.columns]
+        raw = raw.rename(columns={"date": "date"})
+        raw["symbol"] = symbol
+        raw["date"] = pd.to_datetime(raw["date"]).dt.tz_localize(None)
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col not in raw.columns:
+                raw[col] = raw.get("close", 0.0)
+        return raw[["date", "symbol", "open", "high", "low", "close", "volume"]]
+    except Exception:
+        return None
 
 
 def build_features_and_labels(
     data_root: Path,
     ohlcv_parquet: Path,
+    benchmark_symbol: str | None = None,
     horizons: Horizons = Horizons(),
 ) -> tuple[Path, Path]:
     """
@@ -22,8 +67,66 @@ def build_features_and_labels(
     paths = DataPaths(root=data_root)
     ohlcv = read_df_parquet(ohlcv_parquet)
 
+    # Resolve known bad benchmark tickers to their correct Yahoo equivalent
+    if benchmark_symbol and benchmark_symbol in _TICKER_ALIASES:
+        corrected = _TICKER_ALIASES[benchmark_symbol]
+        warnings.warn(
+            f"Benchmark symbol {benchmark_symbol!r} is not available on Yahoo Finance. "
+            f"Automatically using {corrected!r} instead.",
+            UserWarning,
+            stacklevel=2,
+        )
+        benchmark_symbol = corrected
+
     feats = compute_price_features(ohlcv)
     labels = make_forward_returns(ohlcv[["date", "symbol", "close"]], horizons=horizons)
+
+    if benchmark_symbol:
+        available_symbols = labels.index.get_level_values(1).unique().tolist()
+
+        # Auto-fetch benchmark if it wasn't in the ingested data
+        if benchmark_symbol not in available_symbols:
+            ohlcv_dates = pd.to_datetime(ohlcv["date"])
+            data_start = ohlcv_dates.min()
+            data_end = ohlcv_dates.max()
+            warnings.warn(
+                f"Benchmark {benchmark_symbol!r} not in parquet — fetching from Yahoo Finance automatically...",
+                UserWarning,
+                stacklevel=2,
+            )
+            bench_ohlcv = _auto_fetch_benchmark(benchmark_symbol, data_start, data_end)
+            if bench_ohlcv is not None and not bench_ohlcv.empty:
+                # Merge benchmark rows into labels only (not features — we don't rank the index)
+                bench_labels = make_forward_returns(
+                    bench_ohlcv[["date", "symbol", "close"]], horizons=horizons
+                )
+                labels = pd.concat([labels, bench_labels])
+                labels = labels.sort_index()
+                available_symbols = labels.index.get_level_values(1).unique().tolist()
+                print(f"Auto-fetched benchmark {benchmark_symbol!r}: {len(bench_ohlcv)} rows")
+            else:
+                raise ValueError(
+                    f"benchmark_symbol={benchmark_symbol!r} was not found in the OHLCV parquet "
+                    f"and could not be fetched from Yahoo Finance.\n"
+                    f"Valid alternatives: {_VALID_BENCHMARKS}\n"
+                    f"Run ingest with --benchmark-symbol {benchmark_symbol!r} first, or use "
+                    f"--benchmark-symbol '^NSEI' (Nifty 50) which is always available."
+                )
+
+        if benchmark_symbol not in available_symbols:
+            raise ValueError(f"benchmark_symbol={benchmark_symbol!r} has no data rows in labels")
+
+        bench = labels.xs(benchmark_symbol, level=1, drop_level=False)
+        if len(bench) == 0:
+            raise ValueError(f"benchmark_symbol={benchmark_symbol!r} has no data rows in labels")
+
+        bench_by_date = bench.reset_index().set_index("date").drop(columns=["symbol"])
+        excess = make_excess_returns(labels, bench_by_date)
+        labels = labels.join(excess, how="left")
+
+        # Do not train on benchmark itself
+        feats = feats[feats.index.get_level_values(1) != benchmark_symbol]
+        labels = labels[labels.index.get_level_values(1) != benchmark_symbol]
 
     feats_out = paths.features / f"features_{ohlcv_parquet.stem}.parquet"
     labels_out = paths.labels / f"labels_{ohlcv_parquet.stem}.parquet"

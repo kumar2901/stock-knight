@@ -41,6 +41,7 @@ def train_walk_forward(
     labels_parquet: Path,
     horizons: Iterable[str] = ("1d", "7d", "1m", "6m", "12m"),
     model_kind: str = "ridge",
+    target: str = "raw",
     out_dir: Path | None = None,
 ) -> list[TrainResult]:
     """
@@ -65,6 +66,8 @@ def train_walk_forward(
         "6m": "r_fwd_6m",
         "12m": "r_fwd_12m",
     }
+    if target == "excess":
+        horizon_to_col = {k: v + "_excess" for k, v in horizon_to_col.items()}
 
     for h in horizons:
         ycol = horizon_to_col[h]
@@ -85,7 +88,7 @@ def train_walk_forward(
         fold_metrics: list[dict] = []
 
         for split in iter_walk_forward_splits(
-            all_dates, train_years=1, valid_months=2, step_months=2
+            all_dates, train_years=2, valid_months=2, step_months=2
         ):
             train_mask = (hdf.index.get_level_values(0) >= split.train_start) & (
                 hdf.index.get_level_values(0) <= split.train_end

@@ -38,6 +38,10 @@ class YahooFinanceEODClient(BrokerEODClient):
             if not s2:
                 continue
             s2 = s2.upper()
+            # Index / special tickers (e.g., ^NSEI) should be passed through
+            if s2.startswith("^"):
+                out.append(s2)
+                continue
             if "." not in s2:
                 s2 = s2 + self.cfg.default_suffix
             out.append(s2)
@@ -104,4 +108,58 @@ class YahooFinanceEODClient(BrokerEODClient):
                 )
 
         return pd.DataFrame(rows)
+
+    def fetch_ltp(self, symbols: list[str]) -> dict[str, float]:
+        """Nearest live last price via recent daily closes (same symbol keys as inputs)."""
+        try:
+            import yfinance as yf
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("Missing dependency: pip install 'stock-knight[brokers]'") from e
+
+        originals: list[str] = []
+        for s in symbols:
+            if not (s or "").strip():
+                continue
+            originals.append(str(s).strip())
+        if not originals:
+            return {}
+
+        normalized = self._normalize_symbols(originals)
+
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for n in normalized:
+            if n not in seen:
+                seen.add(n)
+                uniq.append(n)
+
+        data = yf.download(
+            tickers=" ".join(uniq),
+            period="7d",
+            group_by="ticker",
+            auto_adjust=self.cfg.auto_adjust,
+            threads=True,
+            progress=False,
+        )
+
+        last_close: dict[str, float] = {}
+        if len(uniq) == 1:
+            sym = uniq[0]
+            d = data.dropna()
+            if not d.empty and "Close" in d.columns:
+                last_close[sym] = float(d["Close"].iloc[-1])
+        elif isinstance(data.columns, pd.MultiIndex):
+            for sym in uniq:
+                if sym not in data.columns.get_level_values(0):
+                    continue
+                d = data[sym].dropna()
+                if d.empty:
+                    continue
+                last_close[sym] = float(d["Close"].iloc[-1])
+
+        out: dict[str, float] = {}
+        for orig, n in zip(originals, normalized, strict=True):
+            if n in last_close:
+                out[orig] = last_close[n]
+        return out
 

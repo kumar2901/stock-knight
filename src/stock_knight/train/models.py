@@ -12,6 +12,7 @@ from sklearn.linear_model import Ridge
 try:
     import lightgbm as lgb
 except Exception:  # pragma: no cover
+    # Import can fail at runtime on macOS if libomp is missing; keep as optional.
     lgb = None  # type: ignore[assignment]
 
 
@@ -44,26 +45,43 @@ def train_lgbm(X: pd.DataFrame, y: pd.Series, horizon: str) -> TrainedModel:
     if lgb is None:
         raise RuntimeError("lightgbm is not installed")
     feature_cols = [c for c in X.columns if c.endswith("_z")]
-    dtrain = lgb.Dataset(X[feature_cols], label=y)
+
+    # Split last 10% of training data as internal validation for early stopping
+    cutoff = int(len(X) * 0.9)
+    X_tr, X_val = X[feature_cols].iloc[:cutoff], X[feature_cols].iloc[cutoff:]
+    y_tr, y_val = y.iloc[:cutoff], y.iloc[cutoff:]
+
+    dtrain = lgb.Dataset(X_tr, label=y_tr)
+    dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+
     params = {
-        "objective": "regression",
-        "metric": "l2",
-        "learning_rate": 0.05,
-        "num_leaves": 63,
-        "min_data_in_leaf": 200,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
+        # Regression on returns, evaluated by correlation (IC) proxy
+        "objective": "regression_l1",   # MAE loss — more robust to outlier returns
+        "metric": "mae",
+        "learning_rate": 0.03,          # Slower learning = more generalizable
+        "num_leaves": 31,               # Reduced from 63 to prevent overfitting
+        "max_depth": 6,                 # Limit tree depth
+        "min_data_in_leaf": 150,        # Each leaf needs 150+ samples
+        "feature_fraction": 0.7,        # Use 70% of features per tree
+        "bagging_fraction": 0.7,        # Use 70% of rows per tree
         "bagging_freq": 1,
+        "lambda_l1": 0.1,               # L1 regularization
+        "lambda_l2": 0.5,               # L2 regularization
+        "min_gain_to_split": 0.01,      # Only split if meaningful gain
         "seed": 7,
         "verbosity": -1,
+        "n_jobs": -1,
     }
     booster = lgb.train(
         params,
         dtrain,
-        num_boost_round=2000,
-        valid_sets=[dtrain],
-        valid_names=["train"],
-        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+        num_boost_round=3000,
+        valid_sets=[dval],
+        valid_names=["valid"],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=75, verbose=False),
+            lgb.log_evaluation(period=-1),
+        ],
     )
     return TrainedModel(kind="lgbm", horizon=horizon, feature_cols=feature_cols, model=booster)
 
