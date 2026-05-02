@@ -7,11 +7,40 @@ import pandas as pd
 
 from stock_knight.features.price_features import compute_price_features
 from stock_knight.labels import Horizons, make_excess_returns, make_forward_returns
+from stock_knight.logger import get_logger
 from stock_knight.storage import DataPaths, read_df_parquet, write_df_parquet
 
-# Map of known-bad / delisted Yahoo Finance tickers → verified working replacement.
-# Tested live 2026-05: ^CNX500, ^NIFTYBANK, ^CNXMIDCAP* are all 404 on Yahoo.
+_log = get_logger(__name__)
+
+# Map broker-specific or broken benchmark names → verified Yahoo Finance ticker.
+# Covers: Angel One names, Zerodha names, Upstox NSE_INDEX names, old broken Yahoo tickers.
 _TICKER_ALIASES: dict[str, str] = {
+    # Angel One SmartAPI instrument names
+    "NIFTY":              "^NSEI",
+    "NIFTY50":            "^NSEI",
+    "NIFTY100":           "^CNX100",
+    "NIFTY200":           "^CNX200",
+    "BANKNIFTY":          "^NSEI",
+    "MIDCPNIFTY":         "^NSMIDCP",
+    "NIFTYMIDCAP150":     "^NSMIDCP",
+    "NIFTY500":           "^NSEI",
+    # Zerodha Kite Connect instrument names
+    "NIFTY 50":           "^NSEI",
+    "NIFTY 100":          "^CNX100",
+    "NIFTY 200":          "^CNX200",
+    "NIFTY BANK":         "^NSEI",
+    "NIFTY MIDCAP 50":    "^NSMIDCP",
+    "NIFTY MIDCAP 150":   "^NSMIDCP",
+    "NIFTY 500":          "^NSEI",
+    # Upstox NSE_INDEX|name format
+    "NSE_INDEX|Nifty 50":         "^NSEI",
+    "NSE_INDEX|Nifty 100":        "^CNX100",
+    "NSE_INDEX|Nifty 200":        "^CNX200",
+    "NSE_INDEX|Nifty Bank":       "^NSEI",
+    "NSE_INDEX|Nifty Midcap 50":  "^NSMIDCP",
+    "NSE_INDEX|NIFTY MIDCAP 150": "^NSMIDCP",
+    "NSE_INDEX|Nifty 500":        "^NSEI",
+    # Old/broken Yahoo Finance tickers (tested 404 as of 2026-05)
     "^CNXMIDCAP":    "^NSMIDCP",
     "^CNXMIDCAP100": "^NSMIDCP",
     "^NSMIDCP100":   "^NSMIDCP",
@@ -67,12 +96,12 @@ def build_features_and_labels(
     paths = DataPaths(root=data_root)
     ohlcv = read_df_parquet(ohlcv_parquet)
 
-    # Resolve known bad benchmark tickers to their correct Yahoo equivalent
+    # Resolve broker-specific or broken benchmark names to their Yahoo Finance equivalent
     if benchmark_symbol and benchmark_symbol in _TICKER_ALIASES:
         corrected = _TICKER_ALIASES[benchmark_symbol]
         warnings.warn(
-            f"Benchmark symbol {benchmark_symbol!r} is not available on Yahoo Finance. "
-            f"Automatically using {corrected!r} instead.",
+            f"Benchmark {benchmark_symbol!r} is a broker-specific name — "
+            f"mapped to Yahoo Finance ticker {corrected!r} for excess-return computation.",
             UserWarning,
             stacklevel=2,
         )
@@ -103,7 +132,7 @@ def build_features_and_labels(
                 labels = pd.concat([labels, bench_labels])
                 labels = labels.sort_index()
                 available_symbols = labels.index.get_level_values(1).unique().tolist()
-                print(f"Auto-fetched benchmark {benchmark_symbol!r}: {len(bench_ohlcv)} rows")
+                _log.info("Auto-fetched benchmark %r: %d rows", benchmark_symbol, len(bench_ohlcv))
             else:
                 raise ValueError(
                     f"benchmark_symbol={benchmark_symbol!r} was not found in the OHLCV parquet "

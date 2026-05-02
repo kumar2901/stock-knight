@@ -28,6 +28,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from stock_knight.logger import get_logger
+
+_log = get_logger(__name__)
+
 import pandas as pd
 
 from stock_knight.brokers.base import BrokerEODClient, BrokerSymbols
@@ -181,13 +185,13 @@ class AngelOneSmartApiClient(BrokerEODClient):
                 msg = str(exc).lower()
                 is_rate_limit = any(kw in msg for kw in self._RATE_LIMIT_MSGS)
                 if is_rate_limit and attempt < len(delays):
-                    print(
-                        f"  [AngelOne] Rate limit hit for {sym} — "
-                        f"retrying in {delays[attempt]}s (attempt {attempt + 1}/{len(delays)})…"
+                    _log.warning(
+                        "AngelOne rate limit hit for %s — retrying in %ds (attempt %d/%d)",
+                        sym, delays[attempt], attempt + 1, len(delays),
                     )
                     continue
                 # Non-rate-limit error or retries exhausted
-                print(f"  [AngelOne] getCandleData failed for {sym}: {exc}")
+                _log.error("AngelOne getCandleData failed for %s: %s", sym, exc)
                 return None
         return None
 
@@ -211,7 +215,7 @@ class AngelOneSmartApiClient(BrokerEODClient):
                 "todate": end.strftime("%Y-%m-%d 15:30"),
             }
             if idx % 20 == 0:
-                print(f"  [AngelOne] Fetched {idx}/{total} symbols…")
+                _log.info("AngelOne OHLCV: fetched %d/%d symbols", idx, total)
             data = self._candle_with_retry(params, sym)
             if not data:
                 time.sleep(self._CANDLE_DELAY_SEC)

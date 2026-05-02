@@ -186,7 +186,7 @@ def cmd_execute(args: argparse.Namespace) -> None:
             )
         else:
             console.print(
-                "\n[bold red]LIVE EXECUTION[/bold red] — placing orders on Zerodha..."
+                f"\n[bold red]LIVE EXECUTION[/bold red] — placing orders via {args.broker}..."
             )
         plan = trader.execute(plan, dry_run=dry_run)
         if args.live:

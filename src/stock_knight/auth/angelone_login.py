@@ -88,10 +88,10 @@ def main(argv: list[str] | None = None) -> None:
             )
         import pyotp
         totp_code = pyotp.TOTP(totp_secret).now()
-        print(f"Generated TOTP code from secret: {totp_code}")
+        print("Generated TOTP code from secret.")  # Do not log the actual code
     elif totp_value:
         totp_code = str(totp_value).strip()
-        print(f"Using provided TOTP value: {totp_code}")
+        print("Using provided TOTP value.")
     else:
         raise SystemExit("No TOTP source found.")
 
@@ -131,8 +131,8 @@ def main(argv: list[str] | None = None) -> None:
     feed_token = data.get("feedToken", "")
 
     print("\nSession generated successfully.")
-    print(f"  jwtToken     : {auth_token[:30]}...")
-    print(f"  feedToken    : {feed_token[:20]}...")
+    print(f"  jwtToken     : {'*' * 20}...  (saved to credentials file)")
+    print(f"  feedToken    : {'*' * 10}...  (saved to credentials file)")
 
     # Save tokens back to credentials.yaml
     creds.setdefault("angelone", {})
