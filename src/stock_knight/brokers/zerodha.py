@@ -6,6 +6,9 @@ from typing import Any
 import pandas as pd
 
 from stock_knight.brokers.base import BrokerEODClient, BrokerSymbols
+from stock_knight.logger import get_logger
+
+_log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -30,11 +33,13 @@ class ZerodhaKiteEODClient(BrokerEODClient):
         self.cfg = cfg
         try:
             from kiteconnect import KiteConnect
-        except Exception as e:  # pragma: no cover
+        except ImportError as e:  # pragma: no cover
             raise RuntimeError("Missing dependency: pip install 'stock-knight[brokers]'") from e
 
         self._kite = KiteConnect(api_key=cfg.api_key)
         self._kite.set_access_token(cfg.access_token)
+        # Cached instrument token map — loaded once per session, not per call
+        self._token_map: dict[str, int] | None = None
 
     def list_symbols(self) -> BrokerSymbols:
         # Listing all symbols can be large; prefer using --symbols-file.
@@ -49,25 +54,38 @@ class ZerodhaKiteEODClient(BrokerEODClient):
         start = pd.to_datetime(start).tz_localize(None)
         end = pd.to_datetime(end).tz_localize(None)
 
-        # Resolve instrument tokens via instruments() once
-        instruments = pd.DataFrame(self._kite.instruments(exchange=self.cfg.exchange))
-        token_map = dict(
-            zip(instruments["tradingsymbol"].astype(str), instruments["instrument_token"], strict=False)
-        )
+        # Load instrument token map once per session (expensive API call)
+        if self._token_map is None:
+            _log.info("Zerodha: loading instrument list for exchange=%s", self.cfg.exchange)
+            try:
+                instruments = pd.DataFrame(self._kite.instruments(exchange=self.cfg.exchange))
+                self._token_map = dict(
+                    zip(instruments["tradingsymbol"].astype(str),
+                        instruments["instrument_token"].astype(int), strict=False)
+                )
+                _log.info("Zerodha: loaded %d instruments", len(self._token_map))
+            except Exception as e:
+                raise RuntimeError(f"Failed to load Zerodha instruments: {e}") from e
 
         rows: list[dict] = []
-        for sym in symbols:
-            token = token_map.get(sym)
+        failed: list[str] = []
+        for idx, sym in enumerate(symbols, 1):
+            token = self._token_map.get(sym)
             if token is None:
+                _log.debug("Zerodha: no instrument token for %s — skipping", sym)
                 continue
-            candles = self._kite.historical_data(
-                instrument_token=int(token),
-                from_date=start.to_pydatetime(),
-                to_date=end.to_pydatetime(),
-                interval="day",
-            )
+            try:
+                candles = self._kite.historical_data(
+                    instrument_token=token,
+                    from_date=start.to_pydatetime(),
+                    to_date=end.to_pydatetime(),
+                    interval="day",
+                )
+            except Exception as e:
+                _log.warning("Zerodha: historical_data failed for %s: %s", sym, e)
+                failed.append(sym)
+                continue
             for c in candles:
-                # c: {date, open, high, low, close, volume}
                 rows.append(
                     {
                         "date": pd.Timestamp(c["date"]).to_pydatetime(),
@@ -79,7 +97,11 @@ class ZerodhaKiteEODClient(BrokerEODClient):
                         "volume": int(c.get("volume", 0)),
                     }
                 )
+            if idx % 25 == 0:
+                _log.info("Zerodha OHLCV: fetched %d/%d symbols", idx, len(symbols))
 
+        if failed:
+            _log.warning("Zerodha: failed to fetch %d symbols: %s", len(failed), failed[:10])
         return pd.DataFrame(rows)
 
     def fetch_ltp(self, symbols: list[str]) -> dict[str, float]:

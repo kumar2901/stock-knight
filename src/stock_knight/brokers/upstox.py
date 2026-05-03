@@ -22,13 +22,16 @@ from __future__ import annotations
 import gzip
 import json
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
 import pandas as pd
 
 from stock_knight.brokers.base import BrokerEODClient, BrokerSymbols
+from stock_knight.logger import get_logger
+
+_log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +139,14 @@ class UpstoxEODClient(BrokerEODClient):
             chunk_start = chunk_end + timedelta(days=1)
 
         rows: list[dict] = []
-        for sym in symbols:
+        failed: list[str] = []
+        for idx, sym in enumerate(symbols, 1):
             instrument_key = self._resolve_key(sym)
             if instrument_key is None:
+                _log.debug("Upstox: no instrument key for %s — skipping", sym)
                 continue
 
+            sym_rows = 0
             for w_start, w_end in windows:
                 try:
                     resp = self._history_api.get_historical_candle_data1(
@@ -151,7 +157,9 @@ class UpstoxEODClient(BrokerEODClient):
                         api_version=self.cfg.api_version,
                     )
                 except Exception as e:
-                    # Skip individual windows that fail (e.g. no data for that period)
+                    _log.warning("Upstox: candle fetch failed for %s [%s→%s]: %s",
+                                 sym, w_start.date(), w_end.date(), e)
+                    failed.append(sym)
                     continue
 
                 candles = getattr(getattr(resp, "data", None), "candles", None) or []
@@ -167,7 +175,13 @@ class UpstoxEODClient(BrokerEODClient):
                             "volume": int(c[5]) if len(c) > 5 else 0,
                         }
                     )
+                    sym_rows += 1
 
+            if idx % 25 == 0:
+                _log.info("Upstox OHLCV: fetched %d/%d symbols", idx, len(symbols))
+
+        if failed:
+            _log.warning("Upstox: failed for %d symbols: %s", len(failed), list(set(failed))[:10])
         return pd.DataFrame(rows) if rows else pd.DataFrame(
             columns=["date", "symbol", "open", "high", "low", "close", "volume"]
         )

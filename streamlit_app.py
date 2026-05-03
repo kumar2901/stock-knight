@@ -157,13 +157,15 @@ def _creds_flag(required_brokers=("zerodha", "upstox", "angelone")) -> str:
 
 
 def _run(cmd: str, label: str = "") -> bool:
-    """Run a shell command, streaming output. Returns True on success."""
+    """Run a shell command as a list of args (no shell=True). Returns True on success."""
+    import shlex as _shlex
     if label:
         st.caption(f"Running: {label}")
     with st.expander("Command", expanded=False):
         st.code(cmd, language="bash")
     with st.spinner("Working…"):
-        p = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+        # Split into args list to avoid shell=True injection risk
+        p = subprocess.run(_shlex.split(cmd), shell=False, text=True, capture_output=True)
     if p.returncode != 0:
         st.error(p.stderr or p.stdout or "Command failed with no output.")
         return False
@@ -333,19 +335,36 @@ with tab_rank:
                     elif broker == "angelone":
                         from stock_knight.brokers.angelone import AngelOneConfig, AngelOneSmartApiClient
                         _a = _creds_data.get("angelone", {})
-                        _bc = AngelOneSmartApiClient(AngelOneConfig(
-                            api_key=_a["api_key"], client_code=_a["client_code"],
-                            password=_a["password"], totp_secret=_a.get("totp_secret", ""),
-                            totp_value=_a.get("totp_value", ""),
-                        ))
+                        _missing = [k for k in ("api_key", "client_code", "password") if not _a.get(k)]
+                        if _missing:
+                            st.error(f"Missing Angel One credentials: {_missing}. Update credentials.yaml.")
+                            _bc = None
+                        else:
+                            _bc = AngelOneSmartApiClient(AngelOneConfig(
+                                api_key=_a["api_key"], client_code=_a["client_code"],
+                                password=_a["password"], totp_secret=_a.get("totp_secret", ""),
+                                totp_value=_a.get("totp_value", ""),
+                            ))
                     elif broker == "upstox":
                         from stock_knight.brokers.upstox import UpstoxConfig, UpstoxEODClient
                         _u = _creds_data.get("upstox", {})
-                        _bc = UpstoxEODClient(UpstoxConfig(access_token=_u["access_token"]))
+                        _at = _u.get("access_token", "")
+                        if not _at or _at.startswith("YOUR_"):
+                            st.error("Missing upstox.access_token in credentials.yaml.")
+                            _bc = None
+                        else:
+                            _bc = UpstoxEODClient(UpstoxConfig(access_token=_at))
                     elif broker == "zerodha":
                         from stock_knight.brokers.zerodha import ZerodhaConfig, ZerodhaKiteEODClient
                         _z = _creds_data.get("zerodha", {})
-                        _bc = ZerodhaKiteEODClient(ZerodhaConfig(api_key=_z["api_key"], access_token=_z["access_token"]))
+                        _missing = [k for k in ("api_key", "access_token") if not _z.get(k)]
+                        if _missing:
+                            st.error(f"Missing Zerodha credentials: {_missing}. Update credentials.yaml.")
+                            _bc = None
+                        else:
+                            _bc = ZerodhaKiteEODClient(ZerodhaConfig(
+                                api_key=_z["api_key"], access_token=_z["access_token"]
+                            ))
                     else:
                         st.warning("Live prices not available for mock broker.")
                         _bc = None
@@ -755,8 +774,13 @@ with tab_trading:
             if broker == "angelone":
                 from stock_knight.execution.angelone_trader import AngelOneTrader
                 return AngelOneTrader(client=client, product=trade_product, order_type=trade_order_type)
-            from stock_knight.execution.zerodha_trader import ZerodhaTrader
-            return ZerodhaTrader(client=client, product=trade_product, order_type=trade_order_type)
+            if broker == "zerodha":
+                from stock_knight.execution.zerodha_trader import ZerodhaTrader
+                return ZerodhaTrader(client=client, product=trade_product, order_type=trade_order_type)
+            # Upstox uses its own order API — trading not yet wired to a dedicated Trader class.
+            st.warning(f"Automated trade execution is not yet supported for broker '{broker}'. "
+                       "Use Zerodha or Angel One for live order placement.")
+            return None
 
         # ── Trading controls ──────────────────────────────────────────────
         tc1, tc2, tc3 = st.columns(3)

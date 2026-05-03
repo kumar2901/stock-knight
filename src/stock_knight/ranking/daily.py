@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -7,8 +8,11 @@ from pathlib import Path
 
 import pandas as pd
 
+from stock_knight.logger import get_logger
 from stock_knight.storage import read_df_parquet, write_json
 from stock_knight.train.models import TrainedModel, load_model
+
+_log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -56,7 +60,6 @@ def rank_for_date(
         )
     effective_asof = candidates[-1]
     if effective_asof != asof:
-        import warnings
         warnings.warn(
             f"No features for {asof.date()} — using nearest available date {effective_asof.date()}.",
             stacklevel=2,
@@ -66,7 +69,44 @@ def rank_for_date(
 
     tm: TrainedModel = load_model(model_path)
     if min_non_na:
-        day = day.dropna(subset=tm.feature_cols)
+        day_full = day.dropna(subset=tm.feature_cols)
+        if len(day_full) == 0:
+            # Some long-lookback features (mom_252d, ma_dist_200) need 200-252 days.
+            # If the parquet covers < 252 days, those are NaN. Fall back to features
+            # that are well-populated on this specific date (≤ 20% NaN stocks).
+            nan_rate_on_day = day[tm.feature_cols].isna().mean()
+            good_feat_cols = nan_rate_on_day[nan_rate_on_day <= 0.20].index.tolist()
+            missing = [c for c in tm.feature_cols if c not in good_feat_cols]
+
+            if not good_feat_cols:
+                raise ValueError(
+                    f"No feature rows available for {asof.date()}. "
+                    f"All {len(tm.feature_cols)} model features are NaN. "
+                    f"Your features parquet likely covers too short a period (< 252 trading days). "
+                    f"Use the full historical features parquet:\n"
+                    f"  data/features/features_ohlcv_2019-01-01_*.parquet\n"
+                    f"Or run: python -m stock_knight.cli features-labels "
+                    f"--ohlcv-parquet data/ohlcv/ohlcv_2019-01-01_<TODAY>.parquet"
+                )
+
+            warnings.warn(
+                f"Short-history parquet: {len(missing)} long-lookback features unavailable "
+                f"({missing[:4]}{'...' if len(missing) > 4 else ''}). "
+                f"Ranking with {len(good_feat_cols)}/{len(tm.feature_cols)} features. "
+                f"For full accuracy use the 2019+ historical parquet.",
+                UserWarning,
+                stacklevel=2,
+            )
+            _log.warning(
+                "Ranking with %d/%d features (missing: %s)",
+                len(good_feat_cols), len(tm.feature_cols), missing[:6],
+            )
+            # Keep stocks that have all the good features, fill missing ones with 0
+            day = day.dropna(subset=good_feat_cols)
+            for c in missing:
+                day[c] = 0.0
+        else:
+            day = day_full
     if len(day) == 0:
         raise ValueError(f"No feature rows available for {asof.date()}")
 
