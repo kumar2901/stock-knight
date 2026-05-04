@@ -17,13 +17,17 @@ Requires-Dist: matplotlib
 Requires-Dist: rich
 Provides-Extra: dev
 Requires-Dist: ruff; extra == "dev"
+Requires-Dist: pytest; extra == "dev"
 Provides-Extra: brokers
 Requires-Dist: yfinance; extra == "brokers"
 Requires-Dist: kiteconnect; extra == "brokers"
 Requires-Dist: upstox-python-sdk; extra == "brokers"
 Requires-Dist: smartapi-python; extra == "brokers"
+Requires-Dist: logzero; extra == "brokers"
+Requires-Dist: pyotp; extra == "brokers"
 Provides-Extra: ui
 Requires-Dist: streamlit; extra == "ui"
+Requires-Dist: plotly; extra == "ui"
 
 # stock-knight
 

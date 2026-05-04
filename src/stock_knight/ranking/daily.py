@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from stock_knight.config import CompositeWeights
 from stock_knight.logger import get_logger
+from stock_knight.ranking.composite import compute_composite
 from stock_knight.storage import read_df_parquet, write_json
 from stock_knight.train.models import TrainedModel, load_model
 
@@ -22,7 +24,7 @@ class RankLists:
     training_target: str  # raw | excess (metadata)
     benchmark_symbol: str | None  # metadata (when training_target=excess)
     ranked: list[str]  # full ranking, best -> worst
-    rows: list[dict]  # per-symbol enriched rows (symbol, score, current_price, target_price, predicted_return)
+    rows: list[dict]  # per-symbol enriched rows (symbol, score, current_price, target_price, predicted_return, composite, recommendation, confidence_pct)
     top10: list[str]
     top20: list[str]
     top30: list[str]
@@ -31,6 +33,8 @@ class RankLists:
     bottom30: list[str]
     live_ltp_fetched_at: str | None = None  # UTC ISO when live quotes were fetched
     live_ltp_broker: str | None = None  # e.g. yahoo | zerodha
+    rank_method: str = "composite"  # composite | score_only
+    composite_weights: dict | None = None  # weights used (composite mode only)
 
 
 def rank_for_date(
@@ -44,9 +48,20 @@ def rank_for_date(
     min_non_na: bool = True,
     fetch_ltp: Callable[[list[str]], dict[str, float]] | None = None,
     live_ltp_broker: str | None = None,
+    universe: list[str] | None = None,
+    rank_method: str = "composite",
+    composite_weights: CompositeWeights | None = None,
 ) -> RankLists:
     feats = read_df_parquet(features_parquet)
     asof = pd.to_datetime(asof).tz_localize(None)
+    if universe is not None and len(universe) > 0:
+        symbols_set = set(universe)
+        feats = feats[feats.index.get_level_values(1).isin(symbols_set)]
+        if len(feats) == 0:
+            raise ValueError(
+                "Features parquet has no overlap with the requested universe "
+                f"({len(symbols_set)} symbols). Re-run ingest with the same universe."
+            )
 
     # Find nearest available date on or before asof
     available_dates = pd.DatetimeIndex(
@@ -66,6 +81,18 @@ def rank_for_date(
         )
     asof = effective_asof
     day = feats.xs(asof, level=0)
+    # Defensive: drop duplicate symbol rows. They can appear when the features
+    # parquet is built from overlapping ingests, or when a benchmark row leaks
+    # into the symbol level. Downstream code (reindex, .loc lookups, row JSON)
+    # assumes unique symbols.
+    if not day.index.is_unique:
+        n_dup = int(day.index.duplicated().sum())
+        warnings.warn(
+            f"{n_dup} duplicate symbol rows on {asof.date()} — keeping first occurrence.",
+            UserWarning,
+            stacklevel=2,
+        )
+        day = day[~day.index.duplicated(keep="first")]
 
     tm: TrainedModel = load_model(model_path)
     if min_non_na:
@@ -111,7 +138,48 @@ def rank_for_date(
         raise ValueError(f"No feature rows available for {asof.date()}")
 
     pred = tm.predict(day)
-    scores = pd.Series(pred, index=day.index, name="score").sort_values(ascending=False)
+    pred_series = pd.Series(pred, index=day.index, name="predicted_return")
+
+    if rank_method not in ("composite", "score_only"):
+        raise ValueError(
+            f"unknown rank_method={rank_method!r}; expected 'composite' or 'score_only'"
+        )
+
+    weights_used: CompositeWeights | None = None
+    if rank_method == "composite":
+        weights_used = composite_weights or CompositeWeights()
+        components = compute_composite(
+            predicted_return=pred_series,
+            features_day=day,
+            weights=weights_used,
+        )
+        sort_key = components.composite
+    else:
+        components = None
+        sort_key = pred_series
+
+    scores = sort_key.sort_values(ascending=False)
+
+    # Recommendation + confidence percent (computed on the sort key — composite
+    # for composite mode, raw score for score_only mode).
+    n = len(scores)
+    top_cut = max(1, int(round(n * 0.20)))
+    bot_cut = max(1, int(round(n * 0.20)))
+    recos: dict[str, str] = {}
+    for i, sym in enumerate(scores.index):
+        if i < top_cut:
+            recos[sym] = "BUY"
+        elif i >= n - bot_cut:
+            recos[sym] = "SELL"
+        else:
+            recos[sym] = "HOLD"
+
+    sd_key = float(scores.std(ddof=0))
+    if sd_key == 0 or pd.isna(sd_key):
+        confidence_pct = pd.Series(0.0, index=scores.index)
+    else:
+        sigma = (scores - scores.mean()) / sd_key
+        confidence_pct = (sigma.abs() / 3.0 * 100.0).clip(upper=100.0).round(1)
 
     # Price enrichment from OHLCV (optional but recommended)
     asof_close: pd.Series
@@ -132,23 +200,34 @@ def rank_for_date(
         live_ltp_fetched_at = datetime.now(UTC).replace(microsecond=0).isoformat()
 
     rows: list[dict] = []
-    for sym, score in scores.items():
+    for sym, sort_score in scores.items():
         cp = float(asof_close.loc[sym]) if sym in asof_close.index else None
-        pr = float(score)
+        # `predicted_return` always comes from the model (used for target price).
+        # Fall back to the sort score if a symbol somehow isn't in pred_series
+        # (shouldn't happen post-dedupe, but be defensive).
+        pr = float(pred_series.loc[sym]) if sym in pred_series.index else float(sort_score)
         tp = (cp * (1.0 + pr)) if cp is not None else None
         ltp = float(ltp_map[sym]) if sym in ltp_map else None
         ltp_tgt = (ltp * (1.0 + pr)) if ltp is not None else None
-        rows.append(
-            {
-                "symbol": sym,
-                "predicted_return": pr,
-                "score": pr,
-                "asof_close": cp,
-                "asof_target_price": tp,
-                "live_ltp": ltp,
-                "live_target_price": ltp_tgt,
-            }
-        )
+        row = {
+            "symbol": sym,
+            "predicted_return": pr,
+            "score": float(sort_score),
+            "asof_close": cp,
+            "asof_target_price": tp,
+            "live_ltp": ltp,
+            "live_target_price": ltp_tgt,
+            "recommendation": recos[sym],
+            "confidence_pct": float(confidence_pct.loc[sym]),
+        }
+        if components is not None:
+            row["composite"] = float(components.composite.loc[sym])
+            row["expected_return_z"] = float(components.expected_return_z.loc[sym])
+            row["sharpe_z"] = float(components.sharpe_z.loc[sym])
+            row["momentum_z"] = float(components.momentum_z.loc[sym])
+            row["low_volatility_z"] = float(components.low_volatility_z.loc[sym])
+            row["model_confidence_z"] = float(components.model_confidence_z.loc[sym])
+        rows.append(row)
 
     ranked = scores.index.tolist()
     top10 = scores.head(10).index.tolist()
@@ -173,6 +252,10 @@ def rank_for_date(
         bottom30=bottom30,
         live_ltp_fetched_at=live_ltp_fetched_at,
         live_ltp_broker=live_ltp_broker if fetch_ltp is not None else None,
+        rank_method=rank_method,
+        composite_weights=(
+            weights_used.model_dump() if weights_used is not None else None
+        ),
     )
 
 
@@ -186,6 +269,8 @@ def write_ranklists(out_path: Path, ranks: RankLists) -> None:
             "benchmark_symbol": ranks.benchmark_symbol,
             "live_ltp_fetched_at": ranks.live_ltp_fetched_at,
             "live_ltp_broker": ranks.live_ltp_broker,
+            "rank_method": ranks.rank_method,
+            "composite_weights": ranks.composite_weights,
             "ranked": ranks.ranked,
             "rows": ranks.rows,
             "top10": ranks.top10,

@@ -32,12 +32,27 @@ class BrokerConfig(BaseModel):
      access_token: str | None = None
  
  
+class CompositeWeights(BaseModel):
+    """Weights used by the composite ranking score.
+
+    Each component is cross-sectionally z-scored before weighting, so
+    weights are unitless and need not sum to 1.
+    """
+
+    expected_return: float = 0.40
+    sharpe: float = 0.25
+    momentum: float = 0.15
+    low_volatility: float = 0.10
+    model_confidence: float = 0.10
+
+
 class ProjectConfig(BaseModel):
      data: DataConfig = Field(default_factory=DataConfig)
      universe: UniverseConfig = Field(default_factory=UniverseConfig)
      broker: BrokerConfig = Field(default_factory=BrokerConfig)
- 
- 
+     composite: CompositeWeights = Field(default_factory=CompositeWeights)
+
+
 def default_config() -> ProjectConfig:
      return ProjectConfig()
  

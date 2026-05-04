@@ -221,6 +221,17 @@ def _load_rank(path: Path) -> dict | None:
     return None
 
 
+def _risk_level_from_lowvol_z(lv_z: float | None) -> str:
+    """Map low_volatility_z component to a coarse risk bucket."""
+    if lv_z is None:
+        return "—"
+    if lv_z > 0.5:
+        return "Low"
+    if lv_z < -0.5:
+        return "High"
+    return "Medium"
+
+
 def _build_rank_df(payload: dict, top_k: int, show_bottom: bool = False) -> pd.DataFrame:
     """Build a clean display DataFrame from rank payload."""
     ranked: list[str] = payload.get("ranked") or []
@@ -235,7 +246,6 @@ def _build_rank_df(payload: dict, top_k: int, show_bottom: bool = False) -> pd.D
         pr = r.get("predicted_return")
         ltp = r.get("live_ltp")
         asof_close = r.get("asof_close")
-        display_price = ltp or asof_close
         target = r.get("live_target_price") or r.get("asof_target_price")
         records.append(
             {
@@ -245,15 +255,137 @@ def _build_rank_df(payload: dict, top_k: int, show_bottom: bool = False) -> pd.D
                 "Close (asof) ₹": round(asof_close, 2) if asof_close else None,
                 "Predicted Return %": round(pr * 100, 2) if pr is not None else None,
                 "Target Price ₹": round(target, 2) if target else None,
+                "Reco": r.get("recommendation") or "—",
+                "Confidence %": r.get("confidence_pct"),
+                "Risk": _risk_level_from_lowvol_z(r.get("low_volatility_z")),
             }
         )
     return pd.DataFrame(records)
 
 
+def _apply_rank_filters(
+    df: pd.DataFrame,
+    *,
+    reco_filter: str,
+    risk_filter: str,
+    pr_min: float,
+    pr_max: float,
+) -> pd.DataFrame:
+    """Apply the Rankings-tab filters to a display DataFrame."""
+    out = df
+    if reco_filter and reco_filter != "All":
+        out = out[out["Reco"] == reco_filter]
+    if risk_filter and risk_filter != "All":
+        out = out[out["Risk"] == risk_filter]
+    if "Predicted Return %" in out.columns:
+        out = out[
+            (out["Predicted Return %"].fillna(0) >= pr_min)
+            & (out["Predicted Return %"].fillna(0) <= pr_max)
+        ]
+    return out.reset_index(drop=True)
+
+
+def _compute_raw_indicators(ohlcv_for_sym: pd.DataFrame) -> dict:
+    """Compute current raw indicator values for one symbol from its OHLCV."""
+    import numpy as _np
+
+    df = ohlcv_for_sym.sort_values("date").reset_index(drop=True)
+    if len(df) < 30:
+        return {}
+    close = df["close"].astype(float)
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, _np.nan)
+    rsi14 = (100 - 100 / (1 + rs)).iloc[-1]
+
+    ema12 = close.ewm(alpha=2 / 13, adjust=False).mean()
+    ema26 = close.ewm(alpha=2 / 27, adjust=False).mean()
+    macd_line = ema12 - ema26
+    macd_sig = macd_line.ewm(span=9, adjust=False).mean()
+    macd_hist_norm = ((macd_line - macd_sig) / close.replace(0, _np.nan)).iloc[-1]
+
+    ma20 = close.rolling(20).mean()
+    sd20 = close.rolling(20).std(ddof=0)
+    upper = ma20 + 2 * sd20
+    lower = ma20 - 2 * sd20
+    width = (upper - lower).replace(0, _np.nan)
+    bb_pct = ((close - lower) / width).iloc[-1]
+
+    def _ma_dist(n: int) -> float | None:
+        if len(close) < n:
+            return None
+        ma = close.rolling(n).mean().iloc[-1]
+        if ma is None or pd.isna(ma) or ma == 0:
+            return None
+        return float(close.iloc[-1] / ma - 1.0)
+
+    ret_1d = close.pct_change()
+    vol21 = ret_1d.rolling(21).std(ddof=0).iloc[-1]
+
+    high_252 = df["high"].astype(float).rolling(252, min_periods=63).max().iloc[-1]
+    low_252 = df["low"].astype(float).rolling(252, min_periods=63).min().iloc[-1]
+
+    return {
+        "RSI_14": float(rsi14) if not pd.isna(rsi14) else None,
+        "MACD_hist_norm": float(macd_hist_norm) if not pd.isna(macd_hist_norm) else None,
+        "BB_pct_20": float(bb_pct) if not pd.isna(bb_pct) else None,
+        "ma_dist_20": _ma_dist(20),
+        "ma_dist_50": _ma_dist(50),
+        "ma_dist_200": _ma_dist(200),
+        "vol_21d": float(vol21) if not pd.isna(vol21) else None,
+        "high_52w": float(high_252) if not pd.isna(high_252) else None,
+        "low_52w": float(low_252) if not pd.isna(low_252) else None,
+    }
+
+
+def _generate_why(row: dict, raw: dict) -> list[str]:
+    """Heuristic 3-4 bullet explanation for the Stock Detail tab."""
+    bullets: list[str] = []
+
+    mom_z = row.get("momentum_z")
+    if mom_z is not None:
+        if mom_z > 1.0:
+            bullets.append(f"Strong 63-day momentum (z={mom_z:+.2f}, top of cross-section).")
+        elif mom_z < -1.0:
+            bullets.append(f"Negative 63-day momentum (z={mom_z:+.2f}, lagging peers).")
+
+    rsi = raw.get("RSI_14")
+    if rsi is not None:
+        if rsi > 70:
+            bullets.append(f"RSI(14)={rsi:.0f} — overbought zone.")
+        elif rsi < 30:
+            bullets.append(f"RSI(14)={rsi:.0f} — oversold; possible bounce.")
+        else:
+            bullets.append(f"RSI(14)={rsi:.0f} — neutral momentum.")
+
+    ma50d = raw.get("ma_dist_50")
+    if ma50d is not None:
+        if ma50d > 0.02:
+            bullets.append(f"Price {ma50d * 100:+.1f}% above 50DMA — uptrend.")
+        elif ma50d < -0.02:
+            bullets.append(f"Price {ma50d * 100:+.1f}% below 50DMA — downtrend.")
+
+    lv_z = row.get("low_volatility_z")
+    if lv_z is not None and lv_z > 1.0:
+        bullets.append("Lower realized volatility than peers (defensive name).")
+    elif lv_z is not None and lv_z < -1.0:
+        bullets.append("Higher realized volatility than peers (riskier name).")
+
+    pr = row.get("predicted_return")
+    if pr is not None:
+        bullets.append(f"Model predicts {pr * 100:+.2f}% forward return.")
+
+    return bullets[:5]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_rank, tab_pipeline, tab_trading = st.tabs(["📊 Rankings", "⚙️ Pipeline", "💹 Trading"])
+tab_rank, tab_detail, tab_pipeline, tab_trading = st.tabs(
+    ["📊 Rankings", "🔎 Stock Detail", "⚙️ Pipeline", "💹 Trading"]
+)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -512,47 +644,131 @@ with tab_rank:
 
         st.divider()
 
+        # ── Filters ───────────────────────────────────────────────────────
+        st.markdown("**Filters**")
+        f1, f2, f3, f4 = st.columns([1.2, 1.2, 3, 1.4])
+        with f1:
+            reco_filter = st.selectbox(
+                "Recommendation",
+                ["All", "BUY", "HOLD", "SELL"],
+                index=0,
+                key="rank_reco_filter",
+            )
+        with f2:
+            risk_filter = st.selectbox(
+                "Risk level",
+                ["All", "Low", "Medium", "High"],
+                index=0,
+                help="Derived from low-volatility z-score component of the composite score.",
+                key="rank_risk_filter",
+            )
+        with f3:
+            pr_min, pr_max = st.slider(
+                "Predicted return range %",
+                min_value=-50.0,
+                max_value=50.0,
+                value=(-50.0, 50.0),
+                step=0.5,
+                key="rank_pr_range",
+            )
+        with f4:
+            custom_topk = st.number_input(
+                "Custom Top-K",
+                min_value=1,
+                max_value=500,
+                value=int(top_k),
+                step=1,
+                help="Overrides the Top-K dropdown above.",
+                key="rank_custom_topk",
+            )
+        effective_topk = int(custom_topk)
+
         def _color_return(val):
             if val is None:
                 return ""
             return "color: green; font-weight: bold" if val > 0 else "color: red; font-weight: bold"
 
+        def _color_reco(val):
+            if val == "BUY":
+                return "color: green; font-weight: bold"
+            if val == "SELL":
+                return "color: red; font-weight: bold"
+            return ""
+
         # Top K table
-        top_df = _build_rank_df(payload, top_k, show_bottom=False)
+        top_df = _build_rank_df(payload, effective_topk, show_bottom=False)
+        top_df = _apply_rank_filters(
+            top_df,
+            reco_filter=reco_filter,
+            risk_filter=risk_filter,
+            pr_min=pr_min,
+            pr_max=pr_max,
+        )
         if not top_df.empty:
-            price_col = "Live LTP ₹" if has_live else "Close (asof) ₹"
             price_label = "📡 Live" if has_live else f"📅 Historical ({effective_date})"
-            st.markdown(f"### 🔼 Top {top_k} — Best predicted return ({rank_horizon.upper()}) | Price: {price_label}")
+            st.markdown(
+                f"### 🔼 Top {effective_topk} — Best predicted return "
+                f"({rank_horizon.upper()}) | Price: {price_label}"
+            )
 
             fmt_cols = {
                 "Close (asof) ₹": "{:.2f}",
                 "Predicted Return %": "{:+.2f}%",
                 "Target Price ₹": "{:.2f}",
+                "Confidence %": "{:.1f}%",
             }
             if has_live:
                 fmt_cols["Live LTP ₹"] = "{:.2f}"
 
-            styled = top_df.style.map(_color_return, subset=["Predicted Return %"]).format(fmt_cols, na_rep="—")
-            # Hide "Close (asof)" column when live LTP is available to reduce clutter
-            if has_live:
-                cols_to_show = [c for c in top_df.columns if c != "Close (asof) ₹"]
-                styled = top_df[cols_to_show].style.map(_color_return, subset=["Predicted Return %"]).format(
-                    {k: v for k, v in fmt_cols.items() if k in cols_to_show}, na_rep="—"
+            cols_to_show = list(top_df.columns)
+            if has_live and "Close (asof) ₹" in cols_to_show:
+                cols_to_show = [c for c in cols_to_show if c != "Close (asof) ₹"]
+
+            styled = (
+                top_df[cols_to_show]
+                .style.map(_color_return, subset=["Predicted Return %"])
+                .map(_color_reco, subset=["Reco"])
+                .format(
+                    {k: v for k, v in fmt_cols.items() if k in cols_to_show},
+                    na_rep="—",
                 )
-            st.dataframe(styled, use_container_width=True, hide_index=True, height=min(42 * top_k + 60, 700))
+            )
+            st.dataframe(
+                styled,
+                use_container_width=True,
+                hide_index=True,
+                height=min(42 * effective_topk + 60, 700),
+            )
+        else:
+            st.info("No rows match the current filters.")
 
         # Bottom K table
         if show_bottom:
-            bot_df = _build_rank_df(payload, top_k, show_bottom=True)
+            bot_df = _build_rank_df(payload, effective_topk, show_bottom=True)
+            bot_df = _apply_rank_filters(
+                bot_df,
+                reco_filter=reco_filter,
+                risk_filter=risk_filter,
+                pr_min=pr_min,
+                pr_max=pr_max,
+            )
             if not bot_df.empty:
-                st.markdown(f"### 🔽 Bottom {top_k} — Worst predicted return ({rank_horizon.upper()})")
-                if has_live:
-                    cols_to_show = [c for c in bot_df.columns if c != "Close (asof) ₹"]
-                    styled_bot = bot_df[cols_to_show].style.map(_color_return, subset=["Predicted Return %"]).format(
-                        {k: v for k, v in fmt_cols.items() if k in cols_to_show}, na_rep="—"
+                st.markdown(
+                    f"### 🔽 Bottom {effective_topk} — Worst predicted return "
+                    f"({rank_horizon.upper()})"
+                )
+                cols_to_show = list(bot_df.columns)
+                if has_live and "Close (asof) ₹" in cols_to_show:
+                    cols_to_show = [c for c in cols_to_show if c != "Close (asof) ₹"]
+                styled_bot = (
+                    bot_df[cols_to_show]
+                    .style.map(_color_return, subset=["Predicted Return %"])
+                    .map(_color_reco, subset=["Reco"])
+                    .format(
+                        {k: v for k, v in fmt_cols.items() if k in cols_to_show},
+                        na_rep="—",
                     )
-                else:
-                    styled_bot = bot_df.style.map(_color_return, subset=["Predicted Return %"]).format(fmt_cols, na_rep="—")
+                )
                 st.dataframe(styled_bot, use_container_width=True, hide_index=True)
 
         st.caption(f"Source: `{rank_path}`")
@@ -564,7 +780,224 @@ with tab_rank:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 2 — PIPELINE
+# TAB 2 — STOCK DETAIL
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_detail:
+    st.header("Stock Detail")
+    st.caption(
+        "Per-symbol drill-down: candlestick chart, indicators, recommendation, "
+        "and a generated explanation of the model's view."
+    )
+
+    detail_payload: dict | None = None
+    detail_path: Path | None = None
+    stored_path = st.session_state.get("last_rank_path")
+    if stored_path:
+        p = Path(stored_path)
+        if p.exists():
+            detail_payload = _load_rank(p)
+            detail_path = p
+    if detail_payload is None:
+        # fall back to latest report
+        if Path("reports").exists():
+            reports = sorted(
+                Path("reports").glob("ranks_*_*.json"),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
+            )
+            if reports:
+                detail_path = reports[0]
+                detail_payload = _load_rank(detail_path)
+
+    if not detail_payload:
+        st.info(
+            "No rank file available yet. Run **🔄 Re-Rank Now** in the Rankings tab "
+            "to populate this view."
+        )
+    else:
+        ranked_syms = detail_payload.get("ranked") or []
+        rows_raw = detail_payload.get("rows") or []
+        row_map = {r.get("symbol"): r for r in rows_raw if r.get("symbol")}
+        horizon_label = (detail_payload.get("horizon") or "").upper() or "—"
+
+        if not ranked_syms:
+            st.warning("Rank file has no ranked symbols.")
+        else:
+            d_top = st.columns([3, 1, 1])
+            with d_top[0]:
+                sel_symbol = st.selectbox(
+                    "Symbol",
+                    ranked_syms,
+                    index=0,
+                    key="detail_symbol",
+                )
+            with d_top[1]:
+                st.metric("Horizon", horizon_label)
+            with d_top[2]:
+                rank_idx = ranked_syms.index(sel_symbol) + 1
+                st.metric("Rank", f"{rank_idx} / {len(ranked_syms)}")
+
+            row = row_map.get(sel_symbol, {})
+
+            # ── Headline cards ────────────────────────────────────────────
+            card_cols = st.columns(5)
+            ltp = row.get("live_ltp") or row.get("asof_close")
+            target = row.get("live_target_price") or row.get("asof_target_price")
+            pr = row.get("predicted_return")
+            reco = row.get("recommendation") or "—"
+            conf = row.get("confidence_pct")
+
+            card_cols[0].metric("Price ₹", f"{ltp:,.2f}" if ltp else "—")
+            card_cols[1].metric(
+                "Target ₹", f"{target:,.2f}" if target else "—",
+                delta=(f"{pr * 100:+.2f}%" if pr is not None else None),
+            )
+            card_cols[2].metric(
+                "Recommendation", reco,
+                help="BUY = top quintile, SELL = bottom quintile, else HOLD.",
+            )
+            card_cols[3].metric(
+                "Confidence",
+                f"{conf:.1f}%" if conf is not None else "—",
+                help="|sort_score sigma| / 3, capped at 100%.",
+            )
+            card_cols[4].metric(
+                "Risk",
+                _risk_level_from_lowvol_z(row.get("low_volatility_z")),
+                help="From low-volatility z-score component.",
+            )
+
+            # ── Chart ─────────────────────────────────────────────────────
+            ohlcv_path = _find_latest_ohlcv()
+            if ohlcv_path is None:
+                st.warning("No OHLCV parquet found — chart unavailable.")
+                sym_ohlcv = pd.DataFrame()
+            else:
+                try:
+                    from stock_knight.storage import read_df_parquet as _rdp
+
+                    full_ohlcv = _rdp(ohlcv_path)
+                    sym_ohlcv = full_ohlcv[full_ohlcv["symbol"] == sel_symbol].copy()
+                    sym_ohlcv["date"] = pd.to_datetime(sym_ohlcv["date"]).dt.tz_localize(None)
+                    sym_ohlcv = sym_ohlcv.sort_values("date").tail(252)
+                except Exception as e:
+                    st.error(f"Failed to read OHLCV: {e}")
+                    sym_ohlcv = pd.DataFrame()
+
+            raw_inds = _compute_raw_indicators(sym_ohlcv) if not sym_ohlcv.empty else {}
+
+            try:
+                import plotly.graph_objects as go
+
+                if not sym_ohlcv.empty:
+                    fig = go.Figure(
+                        data=[
+                            go.Candlestick(
+                                x=sym_ohlcv["date"],
+                                open=sym_ohlcv["open"],
+                                high=sym_ohlcv["high"],
+                                low=sym_ohlcv["low"],
+                                close=sym_ohlcv["close"],
+                                name=sel_symbol,
+                            )
+                        ]
+                    )
+                    if target:
+                        fig.add_hline(
+                            y=target,
+                            line_dash="dash",
+                            line_color="orange",
+                            annotation_text=f"Target ₹{target:,.2f}",
+                            annotation_position="top right",
+                        )
+                    if raw_inds.get("high_52w"):
+                        fig.add_hline(
+                            y=raw_inds["high_52w"],
+                            line_dash="dot",
+                            line_color="green",
+                            annotation_text="52w high",
+                            annotation_position="top left",
+                        )
+                    if raw_inds.get("low_52w"):
+                        fig.add_hline(
+                            y=raw_inds["low_52w"],
+                            line_dash="dot",
+                            line_color="red",
+                            annotation_text="52w low",
+                            annotation_position="bottom left",
+                        )
+                    fig.update_layout(
+                        height=460,
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        xaxis_rangeslider_visible=False,
+                        title=f"{sel_symbol} — last {len(sym_ohlcv)} sessions",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            except ImportError:
+                st.warning(
+                    "`plotly` is not installed. Install with "
+                    "`pip install -e '.[ui]'` to see the candlestick chart."
+                )
+                if not sym_ohlcv.empty:
+                    st.line_chart(
+                        sym_ohlcv.set_index("date")[["close"]],
+                        height=400,
+                    )
+
+            # ── Indicators panel ──────────────────────────────────────────
+            st.markdown("### Indicators")
+            ind_cols = st.columns(7)
+
+            def _fmt_pct(v: float | None) -> str:
+                return f"{v * 100:+.2f}%" if v is not None else "—"
+
+            def _fmt_num(v: float | None, digits: int = 2) -> str:
+                return f"{v:.{digits}f}" if v is not None else "—"
+
+            ind_cols[0].metric("RSI(14)", _fmt_num(raw_inds.get("RSI_14"), 1))
+            ind_cols[1].metric(
+                "MACD hist (norm)", _fmt_pct(raw_inds.get("MACD_hist_norm"))
+            )
+            ind_cols[2].metric("BB %", _fmt_num(raw_inds.get("BB_pct_20"), 2))
+            ind_cols[3].metric("vs 20DMA", _fmt_pct(raw_inds.get("ma_dist_20")))
+            ind_cols[4].metric("vs 50DMA", _fmt_pct(raw_inds.get("ma_dist_50")))
+            ind_cols[5].metric("vs 200DMA", _fmt_pct(raw_inds.get("ma_dist_200")))
+            ind_cols[6].metric("Vol(21d)", _fmt_pct(raw_inds.get("vol_21d")))
+
+            # ── Composite breakdown ───────────────────────────────────────
+            if "composite" in row:
+                st.markdown("### Composite score breakdown")
+                cb_cols = st.columns(6)
+                cb_cols[0].metric("Composite", _fmt_num(row.get("composite"), 3))
+                cb_cols[1].metric("Return z", _fmt_num(row.get("expected_return_z"), 2))
+                cb_cols[2].metric("Sharpe z", _fmt_num(row.get("sharpe_z"), 2))
+                cb_cols[3].metric("Momentum z", _fmt_num(row.get("momentum_z"), 2))
+                cb_cols[4].metric("Low-vol z", _fmt_num(row.get("low_volatility_z"), 2))
+                cb_cols[5].metric(
+                    "Confidence z", _fmt_num(row.get("model_confidence_z"), 2)
+                )
+                weights = detail_payload.get("composite_weights") or {}
+                if weights:
+                    st.caption(
+                        "Weights — "
+                        + " · ".join(f"{k}: {v}" for k, v in weights.items())
+                    )
+
+            # ── Why explanation ───────────────────────────────────────────
+            st.markdown("### Why this view")
+            bullets = _generate_why(row, raw_inds)
+            if bullets:
+                for b in bullets:
+                    st.markdown(f"- {b}")
+            else:
+                st.caption("No interpretable signals — try reranking with a longer feature history.")
+
+            if detail_path is not None:
+                st.caption(f"Source: `{detail_path}`")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 — PIPELINE
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_pipeline:
     st.header("Data & Training Pipeline")
@@ -703,7 +1136,7 @@ with tab_pipeline:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 3 — TRADING
+# TAB 4 — TRADING
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_trading:
     st.header("Live Order Execution")

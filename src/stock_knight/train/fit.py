@@ -8,7 +8,14 @@ import numpy as np
 import pandas as pd
 
 from stock_knight.storage import DataPaths, read_df_parquet, write_json
-from stock_knight.train.models import TrainedModel, train_lgbm, train_ridge, save_model
+from stock_knight.train.models import (
+    TrainedModel,
+    save_model,
+    train_lgbm,
+    train_rf,
+    train_ridge,
+    train_xgb,
+)
 from stock_knight.train.walk_forward import iter_walk_forward_splits
 
 
@@ -33,6 +40,18 @@ def _topk_spread(pred: np.ndarray, y: np.ndarray, k: int) -> float:
     top = y[idx[:k]].mean()
     base = y.mean()
     return float(top - base)
+
+
+def _fit_model(kind: str, X: pd.DataFrame, y: pd.Series, horizon: str) -> TrainedModel:
+    if kind == "ridge":
+        return train_ridge(X, y, horizon=horizon)
+    if kind == "lgbm":
+        return train_lgbm(X, y, horizon=horizon)
+    if kind == "xgb":
+        return train_xgb(X, y, horizon=horizon)
+    if kind == "rf":
+        return train_rf(X, y, horizon=horizon)
+    raise ValueError(f"unknown model_kind={kind}")
 
 
 def train_walk_forward(
@@ -102,12 +121,7 @@ def train_walk_forward(
             if len(train_df) == 0 or len(valid_df) == 0:
                 continue
 
-            if model_kind == "ridge":
-                tm = train_ridge(train_df, train_df[ycol], horizon=h)
-            elif model_kind == "lgbm":
-                tm = train_lgbm(train_df, train_df[ycol], horizon=h)
-            else:
-                raise ValueError(f"unknown model_kind={model_kind}")
+            tm = _fit_model(model_kind, train_df, train_df[ycol], horizon=h)
 
             pred = tm.predict(valid_df)
             yv = valid_df[ycol].to_numpy()
@@ -128,13 +142,7 @@ def train_walk_forward(
                 }
             )
 
-        # Fit final model on full dataset (MVP)
-        if model_kind == "ridge":
-            final_tm = train_ridge(hdf, hdf[ycol], horizon=h)
-        elif model_kind == "lgbm":
-            final_tm = train_lgbm(hdf, hdf[ycol], horizon=h)
-        else:
-            raise ValueError(f"unknown model_kind={model_kind}")
+        final_tm = _fit_model(model_kind, hdf, hdf[ycol], horizon=h)
 
         model_path = out_dir / f"{model_kind}_{h}.joblib"
         save_model(model_path, final_tm)

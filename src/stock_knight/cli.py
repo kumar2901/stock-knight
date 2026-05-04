@@ -8,6 +8,7 @@ from rich.console import Console
  
 from stock_knight.config import ProjectConfig, default_config
 from stock_knight.data.corporate_actions import apply_price_adjustments
+from stock_knight.data.index_universe import load_index_members
 from stock_knight.data.qa import qa_ohlcv_frame
 from stock_knight.data.universe import universe_by_liquidity_rule
 from stock_knight.pipeline.features_labels import build_features_and_labels
@@ -264,6 +265,11 @@ def _print_results(console: Console, plan) -> None:
 
 
 def cmd_rank(args: argparse.Namespace) -> None:
+    universe_name = (getattr(args, "universe", "") or "").lower().strip()
+    universe: list[str] | None = None
+    if universe_name and universe_name != "liquidity":
+        universe = load_index_members(universe_name)
+
     fetch_ltp_cb = None
     ltp_meta: str | None = None
     if getattr(args, "live_ltp", False):
@@ -292,6 +298,8 @@ def cmd_rank(args: argparse.Namespace) -> None:
         benchmark_symbol=str(args.benchmark_symbol) if args.benchmark_symbol else None,
         fetch_ltp=fetch_ltp_cb,
         live_ltp_broker=ltp_meta,
+        universe=universe,
+        rank_method=str(getattr(args, "rank_method", "composite")),
     )
     write_ranklists(Path(args.out), ranks)
 
@@ -305,8 +313,12 @@ def cmd_ingest(args: argparse.Namespace) -> None:
 
     creds = load_credentials(args.creds_file)
     broker = _get_broker_client(args.broker, creds=creds)
+    universe_name = (getattr(args, "universe", "") or "").lower().strip()
     if args.symbols_file:
         symbols = [s.strip() for s in Path(args.symbols_file).read_text().splitlines() if s.strip()]
+    elif universe_name and universe_name != "liquidity":
+        symbols = load_index_members(universe_name)
+        console.print(f"Using static universe '{universe_name}' ({len(symbols)} symbols)")
     else:
         symbols = broker.list_symbols().symbols
     if args.benchmark_symbol:
@@ -370,6 +382,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional file with one symbol per line (recommended for real broker/Yahoo).",
     )
     ingest.add_argument(
+        "--universe",
+        default="liquidity",
+        choices=["liquidity", "nifty50", "nifty100", "nifty150", "nifty500"],
+        help=(
+            "Symbol selection. 'liquidity' (default) keeps existing behavior "
+            "(broker.list_symbols + liquidity rule). "
+            "nifty50/100/150/500 read static lists from data/universe_lists/."
+        ),
+    )
+    ingest.add_argument(
         "--benchmark-symbol",
         default=None,
         help="Optional benchmark symbol to also ingest (e.g., ^NSEI for Yahoo, NIFTY 50 for Zerodha).",
@@ -396,7 +418,9 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--data-root", default="data", help="Root directory for data storage")
     tr.add_argument("--features-parquet", required=True, help="Path to features parquet")
     tr.add_argument("--labels-parquet", required=True, help="Path to labels parquet")
-    tr.add_argument("--model-kind", default="ridge", choices=["ridge", "lgbm"])
+    tr.add_argument(
+        "--model-kind", default="ridge", choices=["ridge", "lgbm", "xgb", "rf"]
+    )
     tr.add_argument(
         "--target",
         default="raw",
@@ -463,6 +487,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--creds-file",
         default=None,
         help="YAML credentials path (needed for Zerodha live LTP).",
+    )
+    rk.add_argument(
+        "--universe",
+        default="liquidity",
+        choices=["liquidity", "nifty50", "nifty100", "nifty150", "nifty500"],
+        help=(
+            "Restrict ranked output to a NIFTY index membership list. "
+            "'liquidity' (default) ranks all symbols present in the features parquet."
+        ),
+    )
+    rk.add_argument(
+        "--rank-method",
+        default="composite",
+        choices=["composite", "score_only"],
+        help=(
+            "How to sort ranked output. 'composite' (default) blends predicted "
+            "return, Sharpe, momentum, low-vol, and model confidence. "
+            "'score_only' preserves the legacy single-score sort."
+        ),
     )
     rk.set_defaults(func=cmd_rank)
 

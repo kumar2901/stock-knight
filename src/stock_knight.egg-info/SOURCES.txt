@@ -5,6 +5,7 @@ src/stock_knight/cli.py
 src/stock_knight/config.py
 src/stock_knight/credentials.py
 src/stock_knight/labels.py
+src/stock_knight/logger.py
 src/stock_knight/storage.py
 src/stock_knight.egg-info/PKG-INFO
 src/stock_knight.egg-info/SOURCES.txt
@@ -24,6 +25,7 @@ src/stock_knight/brokers/upstox.py
 src/stock_knight/brokers/yahoo.py
 src/stock_knight/brokers/zerodha.py
 src/stock_knight/data/corporate_actions.py
+src/stock_knight/data/index_universe.py
 src/stock_knight/data/qa.py
 src/stock_knight/data/universe.py
 src/stock_knight/execution/__init__.py
@@ -32,7 +34,12 @@ src/stock_knight/execution/zerodha_trader.py
 src/stock_knight/features/price_features.py
 src/stock_knight/monitoring/drift.py
 src/stock_knight/pipeline/features_labels.py
+src/stock_knight/ranking/composite.py
 src/stock_knight/ranking/daily.py
 src/stock_knight/train/fit.py
 src/stock_knight/train/models.py
 src/stock_knight/train/walk_forward.py
+tests/test_composite.py
+tests/test_index_universe.py
+tests/test_models_xgb_rf.py
+tests/test_recommendation.py

@@ -7,6 +7,7 @@ from typing import Literal
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
 
 try:
@@ -15,8 +16,13 @@ except Exception:  # pragma: no cover
     # Import can fail at runtime on macOS if libomp is missing; keep as optional.
     lgb = None  # type: ignore[assignment]
 
+try:
+    import xgboost as xgb
+except Exception:  # pragma: no cover
+    xgb = None  # type: ignore[assignment]
 
-ModelKind = Literal["ridge", "lgbm"]
+
+ModelKind = Literal["ridge", "lgbm", "xgb", "rf"]
 
 
 @dataclass(frozen=True)
@@ -31,6 +37,14 @@ class TrainedModel:
             return self.model.predict(X[self.feature_cols].to_numpy())
         if self.kind == "lgbm":
             return self.model.predict(X[self.feature_cols], num_iteration=self.model.best_iteration)
+        if self.kind == "xgb":
+            # xgb.Booster needs DMatrix; XGBRegressor sklearn API takes the DataFrame directly.
+            if xgb is not None and isinstance(self.model, xgb.Booster):
+                dmat = xgb.DMatrix(X[self.feature_cols].to_numpy())
+                return self.model.predict(dmat)
+            return self.model.predict(X[self.feature_cols].to_numpy())
+        if self.kind == "rf":
+            return self.model.predict(X[self.feature_cols].to_numpy())
         raise ValueError(f"unknown kind={self.kind}")
 
 
@@ -84,6 +98,60 @@ def train_lgbm(X: pd.DataFrame, y: pd.Series, horizon: str) -> TrainedModel:
         ],
     )
     return TrainedModel(kind="lgbm", horizon=horizon, feature_cols=feature_cols, model=booster)
+
+
+def train_xgb(X: pd.DataFrame, y: pd.Series, horizon: str) -> TrainedModel:
+    if xgb is None:
+        raise RuntimeError("xgboost is not installed")
+    feature_cols = [c for c in X.columns if c.endswith("_z")]
+
+    cutoff = int(len(X) * 0.9)
+    X_tr, X_val = X[feature_cols].iloc[:cutoff], X[feature_cols].iloc[cutoff:]
+    y_tr, y_val = y.iloc[:cutoff], y.iloc[cutoff:]
+
+    dtrain = xgb.DMatrix(X_tr.to_numpy(), label=y_tr.to_numpy())
+    dval = xgb.DMatrix(X_val.to_numpy(), label=y_val.to_numpy())
+
+    params = {
+        "objective": "reg:absoluteerror",
+        "eval_metric": "mae",
+        "learning_rate": 0.03,
+        "max_depth": 6,
+        "min_child_weight": 150,
+        "subsample": 0.7,
+        "colsample_bytree": 0.7,
+        "reg_alpha": 0.1,
+        "reg_lambda": 0.5,
+        "gamma": 0.01,
+        "seed": 7,
+        "verbosity": 0,
+        "nthread": -1,
+        "tree_method": "hist",
+    }
+    booster = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=3000,
+        evals=[(dval, "valid")],
+        early_stopping_rounds=75,
+        verbose_eval=False,
+    )
+    return TrainedModel(kind="xgb", horizon=horizon, feature_cols=feature_cols, model=booster)
+
+
+def train_rf(X: pd.DataFrame, y: pd.Series, horizon: str) -> TrainedModel:
+    feature_cols = [c for c in X.columns if c.endswith("_z")]
+    m = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_leaf=150,
+        max_features=0.7,
+        bootstrap=True,
+        n_jobs=-1,
+        random_state=7,
+    )
+    m.fit(X[feature_cols].to_numpy(), y.to_numpy())
+    return TrainedModel(kind="rf", horizon=horizon, feature_cols=feature_cols, model=m)
 
 
 def save_model(path: Path, tm: TrainedModel) -> None:

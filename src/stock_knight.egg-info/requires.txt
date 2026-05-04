@@ -15,9 +15,13 @@ yfinance
 kiteconnect
 upstox-python-sdk
 smartapi-python
+logzero
+pyotp
 
 [dev]
 ruff
+pytest
 
 [ui]
 streamlit
+plotly
