@@ -62,3 +62,48 @@ def make_excess_returns(
         out[c + "_excess"] = out[c] - b.to_numpy()
     return out[[c + "_excess" for c in cols]]
 
+
+def make_sector_residual_returns(
+    forward_returns: pd.DataFrame,
+    sector_map: pd.Series,
+) -> pd.DataFrame:
+    """
+    Compute sector-and-date-neutral forward returns.
+
+    For each ``r_fwd_h`` column we subtract the within-(date, sector) median.
+    This removes the sector factor: a model trained on the resulting
+    ``r_fwd_h_sector_residual`` series cannot get credit for picking pharma
+    names just because the pharma sector outperformed the broad index.
+
+    Parameters
+    ----------
+    forward_returns
+        DataFrame indexed by ``(date, symbol)`` with columns ``r_fwd_*``.
+    sector_map
+        Series mapping ``symbol -> sector`` (e.g. from
+        :func:`stock_knight.data.sectors.load_sector_map`). Symbols missing
+        from the map are pooled into a single "Others" bucket so they still
+        get a residual computed (against each other).
+    """
+    if not isinstance(forward_returns.index, pd.MultiIndex):
+        raise ValueError("forward_returns must have a (date, symbol) MultiIndex")
+
+    cols = [c for c in forward_returns.columns if c.startswith("r_fwd_")]
+    if not cols:
+        return forward_returns.copy()
+
+    df = forward_returns.copy()
+    syms = df.index.get_level_values(1)
+    sectors = sector_map.reindex(syms).fillna("Others").to_numpy()
+    df = df.assign(_sector=sectors)
+
+    dates = df.index.get_level_values(0)
+
+    out_cols: dict[str, pd.Series] = {}
+    for c in cols:
+        # Median per (date, sector) — broadcast back to every row.
+        med = df.groupby([dates, df["_sector"]], sort=False)[c].transform("median")
+        out_cols[c + "_sector_residual"] = (df[c] - med).astype(float)
+
+    return pd.DataFrame(out_cols, index=forward_returns.index)
+

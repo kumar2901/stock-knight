@@ -10,7 +10,15 @@ import pandas as pd
 
 from stock_knight.config import CompositeWeights
 from stock_knight.logger import get_logger
-from stock_knight.ranking.composite import compute_composite
+from stock_knight.ranking.composite import compute_composite, _zscore as _mom_cs_zscore
+from stock_knight.ranking.skill_gate import (
+    MIN_HIT_RATE,
+    MIN_PICKS_FOR_HIT_RATE,
+    calibrated_confidence,
+    load_skill_summary,
+    per_symbol_hit_rate,
+    regime_flag,
+)
 from stock_knight.storage import read_df_parquet, write_json
 from stock_knight.train.models import TrainedModel, load_model
 
@@ -24,7 +32,7 @@ class RankLists:
     training_target: str  # raw | excess (metadata)
     benchmark_symbol: str | None  # metadata (when training_target=excess)
     ranked: list[str]  # full ranking, best -> worst
-    rows: list[dict]  # per-symbol enriched rows (symbol, score, current_price, target_price, predicted_return, composite, recommendation, confidence_pct)
+    rows: list[dict]  # per-symbol enriched rows (symbol, score, current_price, target_price, predicted_return, composite, recommendation, confidence_pct, reason)
     top10: list[str]
     top20: list[str]
     top30: list[str]
@@ -35,6 +43,10 @@ class RankLists:
     live_ltp_broker: str | None = None  # e.g. yahoo | zerodha
     rank_method: str = "composite"  # composite | score_only
     composite_weights: dict | None = None  # weights used (composite mode only)
+    regime_flag: str = "unknown"  # ok | low_skill | unknown (from skill gate)
+    recent_ic: float | None = None  # mean Spearman IC of last few walk-forward folds
+    recent_top10_spread: float | None = None  # mean Top-10 spread of same folds
+    skill_source: str | None = None  # path to *_metrics.json consulted
 
 
 def rank_for_date(
@@ -51,6 +63,11 @@ def rank_for_date(
     universe: list[str] | None = None,
     rank_method: str = "composite",
     composite_weights: CompositeWeights | None = None,
+    reports_dir: Path | None = None,
+    labels_parquet: Path | None = None,
+    enable_momentum_gate: bool = True,
+    enable_regime_gate: bool = True,
+    enable_hit_rate_gate: bool = True,
 ) -> RankLists:
     feats = read_df_parquet(features_parquet)
     asof = pd.to_datetime(asof).tz_localize(None)
@@ -160,12 +177,18 @@ def rank_for_date(
 
     scores = sort_key.sort_values(ascending=False)
 
-    # Recommendation + confidence percent (computed on the sort key — composite
-    # for composite mode, raw score for score_only mode).
+    # ── Validation skill summary (Phase 1c/1d) ────────────────────────────
+    # Drives both calibrated confidence and the regime gate. Failing open
+    # (no metrics file) is treated as "unknown" -> neutral 0.5 skill factor.
+    skill = load_skill_summary(model_path)
+    regime = regime_flag(skill)
+
+    # Recommendation buckets (initial assignment by quintile).
     n = len(scores)
     top_cut = max(1, int(round(n * 0.20)))
     bot_cut = max(1, int(round(n * 0.20)))
     recos: dict[str, str] = {}
+    reasons: dict[str, str | None] = {}
     for i, sym in enumerate(scores.index):
         if i < top_cut:
             recos[sym] = "BUY"
@@ -173,13 +196,88 @@ def rank_for_date(
             recos[sym] = "SELL"
         else:
             recos[sym] = "HOLD"
+        reasons[sym] = None
 
-    sd_key = float(scores.std(ddof=0))
-    if sd_key == 0 or pd.isna(sd_key):
-        confidence_pct = pd.Series(0.0, index=scores.index)
-    else:
-        sigma = (scores - scores.mean()) / sd_key
-        confidence_pct = (sigma.abs() / 3.0 * 100.0).clip(upper=100.0).round(1)
+    # ── Phase 1b: momentum-agreement gate ─────────────────────────────────
+    # Downgrade BUY -> HOLD only when BOTH: cross-sectional momentum z < 0
+    # (lags peers) AND absolute 63d trend is negative. This matches the plan
+    # (momentum_z + mom_63d) and avoids nuking a BUY that is merely
+    # middle-of-pack on momentum while still in a positive absolute trend.
+    mom_raw = day["mom_63d"] if "mom_63d" in day.columns else None
+    mom_zsc = day["mom_63d_z"] if "mom_63d_z" in day.columns else None
+    mom_cs_z: pd.Series | None = None
+    if mom_raw is not None:
+        # Same cross-sectional z as `compute_composite` uses for momentum_z.
+        mom_cs_z = _mom_cs_zscore(mom_raw.astype(float))
+    elif mom_zsc is not None:
+        mom_cs_z = mom_zsc.astype(float)
+
+    if enable_momentum_gate and mom_cs_z is not None:
+        for sym in list(recos.keys()):
+            if recos[sym] != "BUY":
+                continue
+            if sym not in mom_cs_z.index:
+                continue
+            if float(mom_cs_z.loc[sym]) >= 0:
+                continue
+            negative_abs_trend = False
+            if mom_raw is not None and sym in mom_raw.index:
+                v = mom_raw.loc[sym]
+                negative_abs_trend = pd.notna(v) and float(v) < 0
+            elif mom_zsc is not None and sym in mom_zsc.index:
+                v = mom_zsc.loc[sym]
+                negative_abs_trend = pd.notna(v) and float(v) < 0
+            if negative_abs_trend:
+                recos[sym] = "HOLD"
+                reasons[sym] = "momentum_disagreement"
+
+    # ── Phase 1d: regime gate ─────────────────────────────────────────────
+    # In a no-skill regime (recent walk-forward IC at/below threshold),
+    # downgrade ALL remaining BUYs to HOLD. The composite ranking is still
+    # produced (for research / dashboard), but we refuse to call anything a
+    # BUY when validation says we have no edge.
+    if enable_regime_gate and skill.is_low_skill:
+        for sym in list(recos.keys()):
+            if recos[sym] == "BUY":
+                recos[sym] = "HOLD"
+                reasons[sym] = "low_skill_regime"
+
+    # ── Phase 3c: per-stock hit-rate suppression ─────────────────────────
+    # If we have a reports/ history and labels parquet, look up each BUY
+    # candidate's historical hit-rate (was-BUY-and-outperformed) and
+    # downgrade names with a sustained miss rate.
+    hit_rate: pd.Series | None = None
+    if (
+        enable_hit_rate_gate
+        and reports_dir is not None
+        and labels_parquet is not None
+        and reports_dir.exists()
+        and labels_parquet.exists()
+    ):
+        try:
+            hit_rate = per_symbol_hit_rate(
+                reports_dir=reports_dir,
+                labels_parquet=labels_parquet,
+                horizon=horizon,
+                lookback_files=100,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            warnings.warn(f"per_symbol_hit_rate failed: {e}", UserWarning, stacklevel=2)
+            hit_rate = None
+
+    if hit_rate is not None and len(hit_rate) > 0:
+        for sym in list(recos.keys()):
+            if recos[sym] != "BUY":
+                continue
+            if sym in hit_rate.index and float(hit_rate.loc[sym]) < MIN_HIT_RATE:
+                recos[sym] = "HOLD"
+                reasons[sym] = f"low_hit_rate(<{int(MIN_HIT_RATE * 100)}%)"
+
+    # ── Phase 1c: calibrated confidence ───────────────────────────────────
+    # Replaces the legacy |sigma|/3 cap-at-100 scheme with a
+    # percentile * skill_factor mapping (0..95). In a low-skill regime the
+    # ceiling collapses (skill_factor ~ 0), so users see "I don't trust this".
+    confidence_pct = calibrated_confidence(scores, skill, cap=95.0)
 
     # Price enrichment from OHLCV (optional but recommended)
     asof_close: pd.Series
@@ -219,6 +317,12 @@ def rank_for_date(
             "live_target_price": ltp_tgt,
             "recommendation": recos[sym],
             "confidence_pct": float(confidence_pct.loc[sym]),
+            "reason": reasons.get(sym),
+            "hit_rate": (
+                float(hit_rate.loc[sym])
+                if hit_rate is not None and sym in hit_rate.index
+                else None
+            ),
         }
         if components is not None:
             row["composite"] = float(components.composite.loc[sym])
@@ -227,6 +331,17 @@ def rank_for_date(
             row["momentum_z"] = float(components.momentum_z.loc[sym])
             row["low_volatility_z"] = float(components.low_volatility_z.loc[sym])
             row["model_confidence_z"] = float(components.model_confidence_z.loc[sym])
+        for col in day.columns:
+            if not str(col).startswith("yf_"):
+                continue
+            try:
+                v = day.loc[sym, col]
+            except (KeyError, TypeError):
+                continue
+            if pd.isna(v):
+                row[col] = None
+            else:
+                row[col] = float(v)
         rows.append(row)
 
     ranked = scores.index.tolist()
@@ -256,6 +371,12 @@ def rank_for_date(
         composite_weights=(
             weights_used.model_dump() if weights_used is not None else None
         ),
+        regime_flag=regime,
+        recent_ic=None if skill.is_unknown else float(skill.recent_ic),
+        recent_top10_spread=(
+            None if skill.is_unknown else float(skill.recent_top10)
+        ),
+        skill_source=skill.source,
     )
 
 
@@ -271,6 +392,10 @@ def write_ranklists(out_path: Path, ranks: RankLists) -> None:
             "live_ltp_broker": ranks.live_ltp_broker,
             "rank_method": ranks.rank_method,
             "composite_weights": ranks.composite_weights,
+            "regime_flag": ranks.regime_flag,
+            "recent_ic": ranks.recent_ic,
+            "recent_top10_spread": ranks.recent_top10_spread,
+            "skill_source": ranks.skill_source,
             "ranked": ranks.ranked,
             "rows": ranks.rows,
             "top10": ranks.top10,

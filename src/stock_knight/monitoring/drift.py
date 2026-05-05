@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +17,9 @@ class DriftReport:
     ic_std: float
     top20_spread_mean: float
     turnover_mean: float | None
+    # Phase 4b: time series of rolling daily IC, used by the UI skill panel.
+    # Each element is {"date": "YYYY-MM-DD", "ic_30d": float, "ic_90d": float}.
+    rolling_ic: list[dict] = field(default_factory=list)
 
 
 def _spearman_ic_by_date(scores: pd.Series, y: pd.Series) -> pd.Series:
@@ -39,6 +42,26 @@ def _spearman_ic_by_date(scores: pd.Series, y: pd.Series) -> pd.Series:
     return df.groupby(level=0).apply(_ic).sort_index()
 
 
+def _rolling_ic_series(ic: pd.Series) -> list[dict]:
+    """Build a list of {date, ic_30d, ic_90d} entries for the UI panel."""
+    if len(ic) == 0:
+        return []
+    df = ic.to_frame("ic").sort_index()
+    df["ic_30d"] = df["ic"].rolling(30, min_periods=10).mean()
+    df["ic_90d"] = df["ic"].rolling(90, min_periods=30).mean()
+    out: list[dict] = []
+    for d, row in df.iterrows():
+        out.append(
+            {
+                "date": pd.Timestamp(d).strftime("%Y-%m-%d"),
+                "ic": (None if pd.isna(row["ic"]) else float(row["ic"])),
+                "ic_30d": (None if pd.isna(row["ic_30d"]) else float(row["ic_30d"])),
+                "ic_90d": (None if pd.isna(row["ic_90d"]) else float(row["ic_90d"])),
+            }
+        )
+    return out
+
+
 def drift_report_from_scores(
     scores: pd.Series,
     labels: pd.Series,
@@ -54,6 +77,7 @@ def drift_report_from_scores(
             ic_std=float("nan"),
             top20_spread_mean=float("nan"),
             turnover_mean=None,
+            rolling_ic=[],
         )
 
     ic_w = ic.tail(window_days)
@@ -64,6 +88,7 @@ def drift_report_from_scores(
         ic_std=float(ic_w.std(ddof=0)),
         top20_spread_mean=float("nan"),
         turnover_mean=None,
+        rolling_ic=_rolling_ic_series(ic),
     )
 
 
@@ -77,6 +102,7 @@ def write_drift_report(path: Path, report: DriftReport) -> None:
             "ic_std": report.ic_std,
             "top20_spread_mean": report.top20_spread_mean,
             "turnover_mean": report.turnover_mean,
+            "rolling_ic": report.rolling_ic,
         },
     )
 

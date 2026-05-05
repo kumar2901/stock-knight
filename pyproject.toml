@@ -5,18 +5,19 @@
  readme = "README.md"
  requires-python = ">=3.11"
  dependencies = [
-   "numpy",
-   "pandas",
-   "pyarrow",
-   "scikit-learn",
-   "lightgbm",
-   "xgboost",
-   "tqdm",
-   "pydantic>=2",
-   "pyyaml",
-   "matplotlib",
-   "rich",
- ]
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "scikit-learn",
+  "lightgbm",
+  "xgboost",
+  "tqdm",
+  "pydantic>=2",
+  "pyyaml",
+  "matplotlib",
+  "rich",
+  "yfinance",
+]
  
  [project.optional-dependencies]
  dev = [

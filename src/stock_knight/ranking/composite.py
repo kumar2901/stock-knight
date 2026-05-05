@@ -9,20 +9,25 @@ explanation.
 Components
 ----------
 - `expected_return`  : the model's predicted forward return.
-- `sharpe`           : `predicted_return / vol_21d` (risk-adjusted return).
-- `momentum`         : raw 63-day momentum (`mom_63d`).
-- `low_volatility`   : negative of `vol_21d` (rewards stable names).
+- `sharpe`           : `predicted_return / (raw_vol_21d + floor)` (risk-adjusted
+                       return; uses RAW daily realized vol, not a z-score).
+- `momentum`         : 63-day momentum (`mom_63d`; raw preferred, `_z` fallback).
+- `low_volatility`   : negative of `vol_21d_z` (rewards stable names).
 - `model_confidence` : `|predicted_return| / cross_sectional_std(predicted_return)`
                        (proxy: how far from the mean a name's prediction is).
 
 Notes
 -----
-- Volatility (`vol_21d`) and momentum (`mom_63d`) are read from the *raw*
-  (pre-z-score) columns in the features parquet. The features pipeline writes
-  only the `_z` versions on disk, so we accept the z-scored series and treat
-  them as the inputs (rank order is identical anyway).
-- If a needed column is missing, the component is treated as zero — the
-  composite degrades gracefully to whatever components are available.
+- Sharpe uses RAW `vol_21d` when available. The previous implementation divided
+  predicted return by `vol_21d_z - vol_21d_z.min() + 1` which systematically
+  amplified low-vol names by ~10x (z-score range ~5, raw vol range ~2x). That
+  pulled defensive / pharma names into the Top-10 regardless of prediction
+  magnitude. The raw-vol denominator still rewards low-vol names (that's what
+  Sharpe *is*) but with a much more moderate ~2x spread.
+- If raw `vol_21d` is missing (older features parquet), we fall back to a
+  percentile-rank denominator in [0.5, 1.5] — moderate, not 10x.
+- If a needed column is missing entirely, the component is treated as zero —
+  composite degrades gracefully.
 """
 from __future__ import annotations
 
@@ -55,6 +60,40 @@ def _zscore(s: pd.Series) -> pd.Series:
     return (x - mu) / sd
 
 
+def _sharpe_denominator(
+    features_day: pd.DataFrame, index: pd.Index
+) -> tuple[pd.Series, str]:
+    """
+    Build the denominator used by the Sharpe component.
+
+    Returns (denominator_series, mode_used) where mode_used is one of:
+      - "raw_vol"       : raw `vol_21d` (daily realized vol, preferred).
+      - "rank_pct"      : percentile rank of `vol_21d_z` mapped to [0.5, 1.5].
+      - "zero_fallback" : no vol info available — denom is 1 everywhere.
+    """
+    if "vol_21d" in features_day.columns:
+        raw = features_day["vol_21d"].reindex(index).astype(float)
+        if raw.notna().any():
+            # Floor the denominator at 25% of the cross-sectional median to
+            # prevent a tiny-vol outlier from exploding Sharpe.
+            floor = float(np.nanmedian(raw.to_numpy())) * 0.25
+            if not np.isfinite(floor) or floor <= 0:
+                floor = 0.005  # ~0.5% daily vol floor
+            denom = raw.fillna(raw.median()).clip(lower=floor)
+            return denom, "raw_vol"
+
+    if "vol_21d_z" in features_day.columns:
+        vol_z = features_day["vol_21d_z"].reindex(index).astype(float).fillna(0.0)
+        # Convert z-score to a percentile rank in [0, 1], then map to [0.5, 1.5].
+        # This keeps the denominator bounded so the low-vol boost is at most 3x,
+        # not 10x like the legacy formula.
+        pct = vol_z.rank(pct=True).fillna(0.5)
+        denom = 0.5 + pct
+        return denom, "rank_pct"
+
+    return pd.Series(1.0, index=index), "zero_fallback"
+
+
 def compute_composite(
     *,
     predicted_return: pd.Series,
@@ -70,10 +109,11 @@ def compute_composite(
         Series indexed by symbol containing the model's predicted forward
         return on the as-of date. NaNs are filled with 0.
     features_day
-        Features for the same as-of date, indexed by symbol. Used to extract
-        `vol_21d_z` (for Sharpe and low-vol) and `mom_63d_z` (for momentum).
-        Z-scored versions are accepted because the feature pipeline only
-        persists the `_z` columns; rank order matches the raw values.
+        Features for the same as-of date, indexed by symbol. Reads:
+          - `vol_21d` (raw, preferred) for Sharpe denominator; falls back to
+             `vol_21d_z` rank if raw is absent.
+          - `vol_21d_z` for the low-volatility tilt component.
+          - `mom_63d` (raw) or `mom_63d_z` for the momentum component.
     weights
         Optional override; defaults to `CompositeWeights()`.
 
@@ -95,17 +135,21 @@ def compute_composite(
     )
     vol_z = vol_z.fillna(0.0).astype(float)
 
-    mom_z = (
-        features_day["mom_63d_z"].reindex(pred.index)
-        if "mom_63d_z" in features_day.columns
-        else pd.Series(0.0, index=pred.index)
-    )
-    mom_z = mom_z.fillna(0.0).astype(float)
+    if "mom_63d" in features_day.columns:
+        mom_raw = features_day["mom_63d"].reindex(pred.index).astype(float).fillna(0.0)
+        mom_z = _zscore(mom_raw)
+    elif "mom_63d_z" in features_day.columns:
+        mom_z = features_day["mom_63d_z"].reindex(pred.index).fillna(0.0).astype(float)
+    else:
+        mom_z = pd.Series(0.0, index=pred.index)
 
-    # Sharpe: predicted return / realized vol. Use z-scored vol; add a tiny
-    # offset so we never divide by zero in extremes.
-    safe_vol = vol_z - vol_z.min() + 1.0
-    sharpe = pred / safe_vol
+    # Sharpe: predicted return / realized vol (raw). Using raw vol gives a
+    # moderate ~2x spread between low-vol and high-vol names instead of the
+    # legacy ~10x amplification, which was the primary driver of defensive
+    # names (pharma/telecom) dominating the Top-K list regardless of the
+    # underlying prediction quality.
+    denom, _mode = _sharpe_denominator(features_day, pred.index)
+    sharpe = pred / denom
     sharpe_z = _zscore(sharpe)
 
     low_vol_component = -vol_z

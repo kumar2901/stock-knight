@@ -1,6 +1,7 @@
 from __future__ import annotations
- 
+
 import argparse
+import json
 from pathlib import Path
  
 import pandas as pd
@@ -288,6 +289,12 @@ def cmd_rank(args: argparse.Namespace) -> None:
         elif b == "upstox":
             ltp_meta = "upstox"
 
+    reports_dir_arg = getattr(args, "reports_dir", "reports") or ""
+    reports_dir_path = Path(reports_dir_arg) if reports_dir_arg else None
+    labels_parquet_path = (
+        Path(args.labels_parquet) if getattr(args, "labels_parquet", None) else None
+    )
+
     ranks = rank_for_date(
         features_parquet=Path(args.features_parquet),
         ohlcv_parquet=Path(args.ohlcv_parquet) if args.ohlcv_parquet else None,
@@ -300,8 +307,66 @@ def cmd_rank(args: argparse.Namespace) -> None:
         live_ltp_broker=ltp_meta,
         universe=universe,
         rank_method=str(getattr(args, "rank_method", "composite")),
+        reports_dir=reports_dir_path,
+        labels_parquet=labels_parquet_path,
+        enable_momentum_gate=not getattr(args, "no_momentum_gate", False),
+        enable_regime_gate=not getattr(args, "no_regime_gate", False),
+        enable_hit_rate_gate=not getattr(args, "no_hit_rate_gate", False),
     )
     write_ranklists(Path(args.out), ranks)
+
+
+def cmd_verify_rank(args: argparse.Namespace) -> None:
+    """Post-rank acceptance: symbols must not be BUY; optional confidence ceiling."""
+    console = Console()
+    path = Path(args.rank_file)
+    if not path.exists():
+        raise SystemExit(f"Rank file not found: {path}")
+
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"Invalid rank JSON at {path}: {e}") from e
+
+    rows: list = payload.get("rows") or []
+    sym_to_row: dict[str, dict] = {}
+    for r in rows:
+        s = r.get("symbol")
+        if s:
+            sym_to_row[str(s).strip()] = r
+
+    raw = getattr(args, "must_not_buy", "") or ""
+    forbidden = [x.strip().upper() for x in raw.split(",") if x.strip()]
+    bad_buy: list[str] = []
+    for sym in forbidden:
+        row = sym_to_row.get(sym) or sym_to_row.get(sym.upper())
+        if row and (row.get("recommendation") or "").upper() == "BUY":
+            bad_buy.append(sym)
+
+    if bad_buy:
+        console.print(
+            f"[red]verify-rank failed[/red]: BUY not allowed for: {', '.join(bad_buy)}"
+        )
+        raise SystemExit(2)
+
+    if not args.skip_confidence_check:
+        cap = float(args.max_confidence)
+        for r in rows:
+            sym = r.get("symbol", "?")
+            c = r.get("confidence_pct")
+            if c is None:
+                continue
+            try:
+                cv = float(c)
+            except (TypeError, ValueError):
+                continue
+            if cv > cap + 1e-6:
+                console.print(
+                    f"[red]verify-rank failed[/red]: {sym} confidence_pct={cv} exceeds cap {cap}"
+                )
+                raise SystemExit(3)
+
+    console.print("[green]verify-rank OK[/green] — must-not-buy list clean; confidence cap respected.")
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
@@ -406,11 +471,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional benchmark symbol present in OHLCV to build excess-return labels.",
     )
+    fl.add_argument(
+        "--sectors-csv",
+        default="data/sectors.csv",
+        help=(
+            "Path to symbol->sector CSV. When present, sector-residual labels "
+            "(r_fwd_h_sector_residual) are added so models can train against a "
+            "sector-neutral target. Pass empty string to disable."
+        ),
+    )
+    fl.add_argument(
+        "--yfinance-fundamentals",
+        action="store_true",
+        help=(
+            "Enrich features with Yahoo Finance snapshot P/E, P/B, dividend yield, "
+            "balance-sheet ratios (via yfinance). Slow for large universes; "
+            "retrain models after enabling. Install: pip install yfinance"
+        ),
+    )
+    fl.add_argument(
+        "--yfinance-delay",
+        type=float,
+        default=0.2,
+        help="Seconds between yfinance symbol requests (rate limit).",
+    )
     fl.set_defaults(
         func=lambda a: build_features_and_labels(
             data_root=Path(a.data_root),
             ohlcv_parquet=Path(a.ohlcv_parquet),
             benchmark_symbol=str(a.benchmark_symbol) if a.benchmark_symbol else None,
+            sectors_csv=(Path(a.sectors_csv) if getattr(a, "sectors_csv", "") else None),
+            yfinance_fundamentals=bool(getattr(a, "yfinance_fundamentals", False)),
+            yfinance_delay_s=float(getattr(a, "yfinance_delay", 0.2)),
         )
     )
 
@@ -419,13 +511,28 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--features-parquet", required=True, help="Path to features parquet")
     tr.add_argument("--labels-parquet", required=True, help="Path to labels parquet")
     tr.add_argument(
-        "--model-kind", default="ridge", choices=["ridge", "lgbm", "xgb", "rf"]
+        "--model-kind",
+        default="ridge",
+        choices=["ridge", "lgbm", "lgbm_rank", "xgb", "rf", "ensemble"],
+        help=(
+            "ridge | lgbm | lgbm_rank (LambdaRank, recommended for 7D/1M) | "
+            "xgb | rf | ensemble (rank-average of lgbm+xgb+ridge+rf)."
+        ),
     )
     tr.add_argument(
         "--target",
         default="raw",
-        choices=["raw", "excess"],
-        help="Train on raw forward returns or benchmark-relative excess returns (requires *_excess labels).",
+        choices=["raw", "excess", "sector_residual"],
+        help=(
+            "Forward-return target: raw, excess (vs benchmark), or "
+            "sector_residual (raw - sector-day median; requires labels parquet "
+            "produced with --sectors-csv)."
+        ),
+    )
+    tr.add_argument(
+        "--no-winsorize",
+        action="store_true",
+        help="Disable per-date 1/99 winsorization of forward returns (debug only).",
     )
     tr.set_defaults(
         func=lambda a: train_walk_forward(
@@ -434,6 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
             labels_parquet=Path(a.labels_parquet),
             model_kind=str(a.model_kind),
             target=str(a.target),
+            winsorize=not bool(getattr(a, "no_winsorize", False)),
         )
     )
 
@@ -463,7 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
     rk.add_argument(
         "--training-target",
         default="raw",
-        choices=["raw", "excess"],
+        choices=["raw", "excess", "sector_residual"],
         help="Metadata only: records which training target you used when producing this rank file.",
     )
     rk.add_argument(
@@ -507,7 +615,61 @@ def build_parser() -> argparse.ArgumentParser:
             "'score_only' preserves the legacy single-score sort."
         ),
     )
+    rk.add_argument(
+        "--labels-parquet",
+        default=None,
+        help=(
+            "Optional labels parquet. When provided alongside --reports-dir, "
+            "enables per-stock hit-rate suppression of BUY recommendations."
+        ),
+    )
+    rk.add_argument(
+        "--reports-dir",
+        default="reports",
+        help=(
+            "Directory containing historical ranks_*.json files. Used by the "
+            "per-stock hit-rate gate. Set to empty string to disable."
+        ),
+    )
+    rk.add_argument(
+        "--no-momentum-gate",
+        action="store_true",
+        help="Disable Phase-1b momentum-agreement filter (debug only).",
+    )
+    rk.add_argument(
+        "--no-regime-gate",
+        action="store_true",
+        help="Disable Phase-1d low-skill-regime suppression (debug only).",
+    )
+    rk.add_argument(
+        "--no-hit-rate-gate",
+        action="store_true",
+        help="Disable Phase-3c per-stock hit-rate suppression (debug only).",
+    )
     rk.set_defaults(func=cmd_rank)
+
+    vr = sub.add_parser(
+        "verify-rank",
+        help="Acceptance check: listed symbols must not be BUY; optional confidence cap (default 95).",
+    )
+    vr.add_argument("--rank-file", required=True, help="Path to ranks_*.json from rank")
+    vr.add_argument(
+        "--must-not-buy",
+        default="GLAXO,BHARTIHEXA,PFIZER,RAMCOCEM",
+        help="Comma-separated symbols that must not have recommendation BUY.",
+    )
+    vr.add_argument(
+        "--max-confidence",
+        type=float,
+        default=95.0,
+        help="Fail if any row's confidence_pct exceeds this (default 95).",
+    )
+    vr.add_argument(
+        "--skip-confidence-check",
+        action="store_true",
+        help="Only check must-not-buy symbols.",
+    )
+    vr.set_defaults(func=cmd_verify_rank)
 
     ex = sub.add_parser(
         "execute",

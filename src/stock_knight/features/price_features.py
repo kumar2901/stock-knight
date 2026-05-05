@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from stock_knight.features.regime import compute_regime_trend
+
 
 def _cs_zscore(s: pd.Series) -> pd.Series:
     x = s.astype(float)
@@ -188,4 +190,24 @@ def compute_price_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     for c in feature_cols:
         out[c + "_z"] = out.groupby(level=0)[c].transform(_cs_zscore)
 
-    return out.drop(columns=feature_cols)
+    # Keep a small set of raw (un-z-scored) columns that downstream ranking
+    # logic needs in original units (e.g., Sharpe = predicted_return / raw_vol).
+    # Dropping all raw columns would make composite.py fall back to a z-score
+    # denominator, which structurally over-weights low-vol names.
+    raw_keep = [c for c in ("vol_21d", "mom_63d") if c in feature_cols]
+    drop_cols = [c for c in feature_cols if c not in raw_keep]
+    out = out.drop(columns=drop_cols)
+
+    # Phase 3b: regime feature. A per-date market-trend signal broadcast to
+    # every symbol so tree-based models can split on regime. Already
+    # globally standardised; suffix _z lets the standard feature selector
+    # pick it up.
+    try:
+        regime = compute_regime_trend(ohlcv)
+        out = out.join(regime, how="left")
+        out["regime_trend_z"] = out["regime_trend_z"].astype(float).fillna(0.0)
+    except Exception:
+        # Failing to compute regime should never break the whole pipeline.
+        out["regime_trend_z"] = 0.0
+
+    return out

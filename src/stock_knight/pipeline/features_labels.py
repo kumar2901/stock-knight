@@ -5,8 +5,15 @@ from pathlib import Path
 
 import pandas as pd
 
+from stock_knight.data.sectors import load_sector_map
+from stock_knight.features.fundamentals_yfinance import enrich_features_with_yfinance
 from stock_knight.features.price_features import compute_price_features
-from stock_knight.labels import Horizons, make_excess_returns, make_forward_returns
+from stock_knight.labels import (
+    Horizons,
+    make_excess_returns,
+    make_forward_returns,
+    make_sector_residual_returns,
+)
 from stock_knight.logger import get_logger
 from stock_knight.storage import DataPaths, read_df_parquet, write_df_parquet
 
@@ -87,11 +94,26 @@ def build_features_and_labels(
     ohlcv_parquet: Path,
     benchmark_symbol: str | None = None,
     horizons: Horizons = Horizons(),
+    sectors_csv: Path | None = None,
+    yfinance_fundamentals: bool = False,
+    yfinance_delay_s: float = 0.2,
 ) -> tuple[Path, Path]:
     """
     Reads OHLCV parquet, writes:
       - features parquet (indexed by date,symbol)
       - labels parquet (indexed by date,symbol)
+
+    The labels parquet always contains raw ``r_fwd_h`` columns. When
+    ``benchmark_symbol`` is set, additional ``r_fwd_h_excess`` columns are
+    written (relative to the benchmark). When ``sectors_csv`` is provided
+    (default: ``data/sectors.csv``), additional ``r_fwd_h_sector_residual``
+    columns are written — these are the recommended training target for
+    rank-loss objectives (Phase 3a).
+
+    When ``yfinance_fundamentals`` is True, enriches features with Yahoo Finance
+    snapshot ratios (P/E, P/B, dividend yield, balance-sheet metrics) and
+    sector-relative spreads. Requires ``yfinance`` and may take minutes for
+    large universes (see ``yfinance_delay_s``).
     """
     paths = DataPaths(root=data_root)
     ohlcv = read_df_parquet(ohlcv_parquet)
@@ -156,6 +178,25 @@ def build_features_and_labels(
         # Do not train on benchmark itself
         feats = feats[feats.index.get_level_values(1) != benchmark_symbol]
         labels = labels[labels.index.get_level_values(1) != benchmark_symbol]
+
+    sector_map = load_sector_map(sectors_csv)
+
+    if yfinance_fundamentals:
+        feats = enrich_features_with_yfinance(
+            feats,
+            sector_map=sector_map if not sector_map.empty else None,
+            delay_s=yfinance_delay_s,
+        )
+
+    # Sector-residual targets (Phase 3a). Computed across all symbols still
+    # present at this point. Safe even when the sector map is empty —
+    # everything just falls into the "Others" bucket.
+    if not sector_map.empty:
+        sector_residuals = make_sector_residual_returns(
+            labels[[c for c in labels.columns if c.startswith("r_fwd_") and "_excess" not in c and "_sector_residual" not in c]],
+            sector_map=sector_map,
+        )
+        labels = labels.join(sector_residuals, how="left")
 
     feats_out = paths.features / f"features_{ohlcv_parquet.stem}.parquet"
     labels_out = paths.labels / f"labels_{ohlcv_parquet.stem}.parquet"

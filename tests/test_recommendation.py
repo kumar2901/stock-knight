@@ -52,7 +52,7 @@ def test_rank_for_date_emits_recommendation_and_confidence(
     assert "SELL" in recos
 
     for r in ranks.rows:
-        assert 0.0 <= float(r["confidence_pct"]) <= 100.0
+        assert 0.0 <= float(r["confidence_pct"]) <= 95.0
         assert "composite" in r
         assert "expected_return_z" in r
 

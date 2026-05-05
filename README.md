@@ -133,6 +133,17 @@ Build features + labels:
 python -m stock_knight.cli features-labels --ohlcv-parquet data/ohlcv/ohlcv_2019-01-01_2025-12-31.parquet
 ```
 
+Optional — enrich with **Yahoo Finance** snapshot ratios (TTM P/E, P/B, dividend yield, ROE, debt/equity, and balance-sheet–derived current ratio / D/E). Same values are repeated on every historical row per symbol (good for live ranking; less ideal for strict historical backtests). **Retrain** models after adding this, so `*_z` fundamental columns are in `feature_cols`:
+
+```bash
+python -m stock_knight.cli features-labels \
+  --ohlcv-parquet data/ohlcv/ohlcv_2019-01-01_2025-12-31.parquet \
+  --yfinance-fundamentals \
+  --yfinance-delay 0.2
+```
+
+Use `data/sectors.csv` (via `--sectors-csv`) so **sector-relative** spreads (`yf_pe_vs_sector_z`, `yf_pb_vs_sector_z`, `yf_div_yield_vs_sector_z`) are populated.
+
 Train models (baseline ridge):
 
 ```bash

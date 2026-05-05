@@ -11,10 +11,13 @@ from stock_knight.storage import DataPaths, read_df_parquet, write_json
 from stock_knight.train.models import (
     TrainedModel,
     save_model,
+    train_ensemble,
     train_lgbm,
+    train_lgbm_rank,
     train_rf,
     train_ridge,
     train_xgb,
+    winsorize_per_date,
 )
 from stock_knight.train.walk_forward import iter_walk_forward_splits
 
@@ -47,10 +50,14 @@ def _fit_model(kind: str, X: pd.DataFrame, y: pd.Series, horizon: str) -> Traine
         return train_ridge(X, y, horizon=horizon)
     if kind == "lgbm":
         return train_lgbm(X, y, horizon=horizon)
+    if kind == "lgbm_rank":
+        return train_lgbm_rank(X, y, horizon=horizon)
     if kind == "xgb":
         return train_xgb(X, y, horizon=horizon)
     if kind == "rf":
         return train_rf(X, y, horizon=horizon)
+    if kind == "ensemble":
+        return train_ensemble(X, y, horizon=horizon)
     raise ValueError(f"unknown model_kind={kind}")
 
 
@@ -62,12 +69,16 @@ def train_walk_forward(
     model_kind: str = "ridge",
     target: str = "raw",
     out_dir: Path | None = None,
+    winsorize: bool = True,
 ) -> list[TrainResult]:
     """
     Train one model per horizon using a simple walk-forward procedure.
 
-    This is an MVP trainer (baseline ridge or lgbm). It logs fold metrics and
-    trains a final model on the full dataset at the end.
+    Logs per-fold metrics (Spearman IC + Top-K spreads) and trains a final
+    model on the full dataset at the end. When ``winsorize`` is True (default)
+    forward returns are clipped at the 1st / 99th percentile per date before
+    fitting, which dramatically reduces the influence of single-day shocks
+    (COVID lockdown, earnings surprises) on the learned coefficients.
     """
     out_dir = out_dir or (Path("artifacts") / "models")
     X = read_df_parquet(features_parquet)
@@ -87,6 +98,8 @@ def train_walk_forward(
     }
     if target == "excess":
         horizon_to_col = {k: v + "_excess" for k, v in horizon_to_col.items()}
+    elif target == "sector_residual":
+        horizon_to_col = {k: v + "_sector_residual" for k, v in horizon_to_col.items()}
 
     for h in horizons:
         ycol = horizon_to_col[h]
@@ -102,6 +115,10 @@ def train_walk_forward(
         hdf = df[usable + [ycol]].dropna()
         if len(hdf) == 0:
             raise ValueError(f"No training rows available for horizon={h} after dropping NaNs")
+
+        if winsorize:
+            hdf = hdf.copy()
+            hdf[ycol] = winsorize_per_date(hdf[ycol], lower=0.01, upper=0.99)
 
         all_dates = pd.DatetimeIndex(hdf.index.get_level_values(0).unique())
         fold_metrics: list[dict] = []

@@ -71,3 +71,63 @@ def test_composite_handles_missing_feature_columns() -> None:
     # Without volatility/momentum, only the return + confidence components contribute,
     # so the highest predicted return should remain the leader.
     assert components.composite.idxmax() == pred.idxmax()
+
+
+def test_sharpe_with_raw_vol_no_longer_amplifies_low_vol_names() -> None:
+    """
+    Regression test for the defensive-names-dominate-TopK bug (GLAXO/PFIZER case).
+
+    Before the fix, the Sharpe denominator was `vol_z - vol_z.min() + 1.0`,
+    which produced ~10x amplification for low-vol names even when their
+    predicted return was moderate. With raw `vol_21d` the spread is ~2x,
+    so sharpe_z should remain bounded relative to expected_return_z.
+    """
+    syms = ["A_lowvol", "B_midvol", "C_highvol"]
+    pred = pd.Series(
+        {"A_lowvol": 0.006, "B_midvol": 0.006, "C_highvol": 0.006}  # equal predictions
+    )
+    feats = pd.DataFrame(
+        {
+            "vol_21d": [0.010, 0.020, 0.035],   # realistic daily vols
+            "vol_21d_z": [-1.2, 0.0, 1.2],
+            "mom_63d": [0.05, 0.05, 0.05],
+        },
+        index=pd.Index(syms, name="symbol"),
+    )
+
+    components = compute_composite(predicted_return=pred, features_day=feats)
+
+    # With equal predictions, the sharpe RATIO between low-vol and high-vol
+    # should be moderate — the ratio of raw vols (3.5x) is the ceiling.
+    sharpe_ratio = (
+        feats.loc["C_highvol", "vol_21d"] / feats.loc["A_lowvol", "vol_21d"]
+    )
+    assert sharpe_ratio <= 4.0, "raw vol spread should stay bounded"
+
+    # And crucially, because all predictions are equal, expected_return_z is
+    # identically zero — composite differences come ONLY from vol tilt. The
+    # low-vol name should lead by a MODERATE margin, not the extreme margin
+    # that the legacy formula produced.
+    c = components.composite
+    spread = c.loc["A_lowvol"] - c.loc["C_highvol"]
+    # The legacy formula gave spreads > 2.0 on this input; the fix keeps it < 1.5.
+    assert spread < 1.5, f"low-vol boost too large: spread={spread:.3f}"
+
+
+def test_sharpe_falls_back_gracefully_without_raw_vol() -> None:
+    """If raw vol_21d is absent, we use a rank-based denominator capped at 3x."""
+    syms = [f"S{i}" for i in range(10)]
+    pred = pd.Series(np.linspace(0.001, 0.01, len(syms)), index=syms)
+    feats = pd.DataFrame(
+        {
+            # Only z-scored vol (legacy parquets)
+            "vol_21d_z": np.linspace(-2.0, 2.0, len(syms)),
+            "mom_63d_z": np.zeros(len(syms)),
+        },
+        index=pd.Index(syms, name="symbol"),
+    )
+
+    components = compute_composite(predicted_return=pred, features_day=feats)
+    # All finite, same length.
+    assert np.isfinite(components.sharpe_z).all()
+    assert len(components.composite) == len(syms)

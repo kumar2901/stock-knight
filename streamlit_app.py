@@ -56,8 +56,23 @@ with st.sidebar:
 
     st.divider()
     st.header("Model")
-    model_kind = st.selectbox("Model", ["ridge", "lgbm"])
-    train_target = st.selectbox("Training target", ["excess", "raw"])
+    model_kind = st.selectbox(
+        "Model",
+        ["ridge", "lgbm", "lgbm_rank", "xgb", "rf", "ensemble"],
+        index=1,
+        help="Default: lgbm. lgbm_rank = LambdaRank (strong for 7d/1m). ensemble = rank-average of lgbm+xgb+ridge+rf.",
+    )
+    train_target = st.selectbox(
+        "Training target",
+        ["excess", "raw", "sector_residual"],
+        index=0,
+        help="excess = vs benchmark index. sector_residual = vs sector-day median (needs data/sectors.csv in data root).",
+    )
+    yfinance_fundamentals = st.checkbox(
+        "Yahoo fundamentals (yfinance)",
+        value=False,
+        help="Adds P/E, P/B, dividend yield, balance-sheet ratios to features. Slow (~0.2s/symbol); install yfinance. Retrain models after enabling.",
+    )
 
     # Benchmark index options per broker — only verified/eligible tickers listed.
     # Yahoo: tested live; ^CNX500, ^NIFTYBANK, ^CNXMIDCAP are broken on Yahoo Finance.
@@ -114,8 +129,9 @@ with st.sidebar:
         options=_bench_labels,
         index=0,
         help=(
-            "Stocks are ranked by predicted excess return vs this index. "
-            "Only verified eligible tickers shown for the selected broker."
+            "Used when Training target is **excess** (features + labels). "
+            "For **raw** or **sector_residual**, benchmark is ignored for training "
+            "but may still be ingested if you add it during ingest."
         ),
     )
     benchmark_symbol = _bench_values[_bench_labels.index(_bench_sel)]
@@ -133,6 +149,153 @@ def _latest_trading_day() -> date:
     while d.weekday() >= 5:  # Sat=5, Sun=6
         d -= timedelta(days=1)
     return d
+
+
+def _fmt_pct_or_dash(v) -> str:
+    """Format a fraction (e.g. 0.012) as a signed percent ('+1.20%')."""
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v) * 100:+.2f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_ic_or_dash(v) -> str:
+    """Format a Spearman IC value (e.g. 0.024) as a signed 4-decimal number."""
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):+.4f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_optional_num(v, nd: int = 2) -> str:
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):,.{nd}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_yf_pct_ratio(v) -> str:
+    """Format Yahoo ratio often in 0–1 (ROE, margins) as percent."""
+    if v is None:
+        return "—"
+    try:
+        x = float(v)
+        if abs(x) <= 1.0:
+            x *= 100.0
+        return f"{x:.2f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_yf_div_yield(v) -> str:
+    if v is None:
+        return "—"
+    try:
+        x = float(v)
+        if abs(x) <= 1.0:
+            x *= 100.0
+        return f"{x:.2f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+_YF_RAW_SPECS: list[tuple[str, str, str]] = [
+    ("yf_trailing_pe", "TTM P/E", "num"),
+    ("yf_forward_pe", "Forward P/E", "num"),
+    ("yf_pb", "P/B", "num"),
+    ("yf_dividend_yield", "Dividend yield", "div"),
+    ("yf_debt_to_equity", "Debt / equity (Yahoo)", "num"),
+    ("yf_current_ratio", "Current ratio", "num"),
+    ("yf_roe", "ROE", "pct"),
+    ("yf_profit_margin", "Profit margin", "pct"),
+    ("yf_current_ratio_bs", "Current ratio (balance sheet)", "num"),
+    ("yf_debt_to_equity_bs", "Debt / equity (balance sheet)", "num"),
+]
+
+_YF_SECTOR_SPECS: list[tuple[str, str, str]] = [
+    ("yf_pe_vs_sector", "P/E − sector median", "spread"),
+    ("yf_pb_vs_sector", "P/B − sector median", "spread"),
+    ("yf_div_yield_vs_sector", "Div. yield − sector median", "spread_yield"),
+]
+
+_YF_Z_SPECS: list[tuple[str, str]] = [
+    ("yf_trailing_pe_z", "TTM P/E"),
+    ("yf_forward_pe_z", "Forward P/E"),
+    ("yf_pb_z", "P/B"),
+    ("yf_dividend_yield_z", "Dividend yield"),
+    ("yf_debt_to_equity_z", "Debt / equity"),
+    ("yf_current_ratio_z", "Current ratio"),
+    ("yf_roe_z", "ROE"),
+    ("yf_profit_margin_z", "Profit margin"),
+    ("yf_current_ratio_bs_z", "Current ratio (BS)"),
+    ("yf_debt_to_equity_bs_z", "Debt / equity (BS)"),
+    ("yf_pe_vs_sector_z", "P/E vs sector"),
+    ("yf_pb_vs_sector_z", "P/B vs sector"),
+    ("yf_div_yield_vs_sector_z", "Div. yield vs sector"),
+]
+
+
+def _render_yfinance_fundamentals_card(row: dict) -> None:
+    if not any(k.startswith("yf_") for k in row):
+        st.info(
+            "No Yahoo fundamentals in this rank file. Rebuild features with "
+            "**--yfinance-fundamentals** (or enable the sidebar checkbox), then **re-rank**."
+        )
+        return
+
+    st.markdown("### Fundamentals (Yahoo Finance)")
+    st.caption(
+        "Snapshot aligned to your features parquet when it was built. "
+        "**Sector** columns compare this stock to the median of its sector on the same date. "
+        "Expander below shows **z-scores** (cross-section vs peers) used by the model."
+    )
+    st.markdown("**Multiples & balance sheet**")
+    rc = st.columns(5)
+    ri = 0
+    for key, label, kind in _YF_RAW_SPECS:
+        if key not in row:
+            continue
+        v = row.get(key)
+        if kind == "num":
+            txt = _fmt_optional_num(v)
+        elif kind == "div":
+            txt = _fmt_yf_div_yield(v)
+        else:
+            txt = _fmt_yf_pct_ratio(v)
+        rc[ri % 5].metric(label, txt)
+        ri += 1
+
+    if any(spec[0] in row for spec in _YF_SECTOR_SPECS):
+        st.markdown("**Vs sector (median of cohort, same date)**")
+        sc = st.columns(3)
+        si = 0
+        for key, label, kind in _YF_SECTOR_SPECS:
+            if key not in row:
+                continue
+            v = row.get(key)
+            if kind == "spread_yield":
+                txt = _fmt_optional_num(v, 4)
+            else:
+                txt = _fmt_optional_num(v)
+            sc[si % 3].metric(label, txt)
+            si += 1
+
+    z_keys = [k for k, _ in _YF_Z_SPECS if k in row]
+    if z_keys:
+        with st.expander("Model inputs: fundamental z-scores vs peers", expanded=False):
+            zc = st.columns(4)
+            zi = 0
+            for key, label in _YF_Z_SPECS:
+                if key not in row:
+                    continue
+                zc[zi % 4].metric(label, _fmt_ic_or_dash(row.get(key)))
+                zi += 1
 
 
 def _resolve_symbols_file() -> Path | None:
@@ -190,6 +353,44 @@ def _find_latest_ohlcv() -> Path | None:
         return None
     parquets = sorted(ohlcv_dir.glob("ohlcv_*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
     return parquets[0] if parquets else None
+
+
+def _labels_path_from_features(feat_path: Path | None) -> Path | None:
+    """Mirror CLI layout: features -> labels parquet path."""
+    if feat_path is None:
+        return None
+    s = str(feat_path.resolve())
+    if "features_" not in s:
+        return None
+    return Path(s.replace("features_", "labels_").replace("/features/", "/labels/"))
+
+
+def _sectors_csv_path(data_root_str: str) -> Path | None:
+    p = Path(data_root_str) / "sectors.csv"
+    return p if p.exists() else None
+
+
+def _rank_cmd_extras(feat_path: Path | None) -> str:
+    """--reports-dir / --labels-parquet for skill gate & hit-rate (Phase 1c / 3c)."""
+    parts: list[str] = []
+    rep = Path("reports")
+    if rep.exists():
+        parts.append(f"--reports-dir {shlex.quote(str(rep.resolve()))}")
+    lab = _labels_path_from_features(feat_path)
+    if lab is not None and lab.exists():
+        parts.append(f"--labels-parquet {shlex.quote(str(lab.resolve()))}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _features_labels_sectors_arg(data_root_str: str) -> str:
+    sec = _sectors_csv_path(data_root_str)
+    if sec is None:
+        return ""
+    return f" --sectors-csv {shlex.quote(str(sec.resolve()))}"
+
+
+def _yfinance_fl_flag(enabled: bool) -> str:
+    return " --yfinance-fundamentals" if enabled else ""
 
 
 def _find_model(kind: str, horizon: str) -> Path | None:
@@ -340,11 +541,55 @@ def _compute_raw_indicators(ohlcv_for_sym: pd.DataFrame) -> dict:
     }
 
 
-def _generate_why(row: dict, raw: dict) -> list[str]:
+def _generate_why(row: dict, raw: dict, payload: dict | None = None) -> list[str]:
     """Heuristic 3-4 bullet explanation for the Stock Detail tab."""
     bullets: list[str] = []
 
+    # Surface gating reasons first — they explain WHY a high-composite name
+    # is not a BUY (e.g. momentum disagreement, low-skill regime).
+    reason = row.get("reason")
+    if reason == "momentum_disagreement":
+        bullets.append(
+            "**Momentum disagreement** — model in top quintile, but 63-day "
+            "momentum is below peers *and* negative in absolute terms. "
+            "Recommendation downgraded to HOLD."
+        )
+    elif reason == "low_skill_regime":
+        bullets.append(
+            "**Low-skill regime** — recent walk-forward IC is at/below the "
+            "no-edge threshold. All BUYs converted to HOLD."
+        )
+    elif reason and reason.startswith("low_hit_rate"):
+        bullets.append(
+            "**Low historical hit-rate** — this stock has missed too often "
+            "when previously picked as BUY. Downgraded to HOLD."
+        )
+
+    if payload is not None:
+        regime = (payload.get("regime_flag") or "").lower()
+        ic = payload.get("recent_ic")
+        if regime == "ok" and ic is not None:
+            bullets.append(
+                f"Model skill: recent walk-forward IC = {float(ic):+.4f} (ok regime)."
+            )
+        elif regime == "low_skill":
+            bullets.append(
+                "Model is in a no-edge regime — treat any BUY signals with caution."
+            )
+        elif regime == "unknown":
+            bullets.append(
+                "Walk-forward metrics missing — confidence uses a neutral skill factor "
+                "(re-train to populate metrics)."
+            )
+
+    reco = row.get("recommendation")
     mom_z = row.get("momentum_z")
+    if reco == "BUY" and mom_z is not None and float(mom_z) >= 0:
+        bullets.append(
+            "Momentum gate passed — 63d momentum is not both below peers and "
+            "negative in absolute terms (so no disagreement downgrade)."
+        )
+
     if mom_z is not None:
         if mom_z > 1.0:
             bullets.append(f"Strong 63-day momentum (z={mom_z:+.2f}, top of cross-section).")
@@ -377,7 +622,13 @@ def _generate_why(row: dict, raw: dict) -> list[str]:
     if pr is not None:
         bullets.append(f"Model predicts {pr * 100:+.2f}% forward return.")
 
-    return bullets[:5]
+    hit = row.get("hit_rate")
+    if hit is not None:
+        bullets.append(
+            f"Historical hit-rate when picked as BUY: {float(hit) * 100:.1f}%."
+        )
+
+    return bullets[:7]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -552,7 +803,9 @@ with tab_rank:
                     f"python -m stock_knight.cli features-labels "
                     f"--data-root {shlex.quote(data_root)} "
                     f"--ohlcv-parquet {shlex.quote(str(ohlcv_path))}"
-                    + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else ""),
+                    + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
+                    + _features_labels_sectors_arg(data_root)
+                    + _yfinance_fl_flag(yfinance_fundamentals),
                     label="Rebuilding features",
                 )
                 if not ok:
@@ -595,7 +848,8 @@ with tab_rank:
             f"--training-target {train_target}"
             + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
             + ltp_part
-            + f" --out {shlex.quote(str(out_path))}",
+            + f" --out {shlex.quote(str(out_path))}"
+            + _rank_cmd_extras(feat_path),
             label="Ranking stocks",
         )
         if ok:
@@ -622,6 +876,33 @@ with tab_rank:
         meta3.metric("Training Target", payload.get("training_target", "—"))
         ltp_ts = payload.get("live_ltp_fetched_at")
         meta4.metric("LTP Fetched", ltp_ts[:16] + " UTC" if ltp_ts else "Historical close only")
+
+        # ── Phase 4a: model-skill regime banner ───────────────────────────
+        regime = (payload.get("regime_flag") or "unknown").lower()
+        recent_ic = payload.get("recent_ic")
+        recent_top10 = payload.get("recent_top10_spread")
+
+        if regime == "low_skill":
+            st.error(
+                "**Low-skill regime detected.** "
+                f"Recent walk-forward IC = {_fmt_ic_or_dash(recent_ic)} "
+                f"and Top-10 spread = {_fmt_pct_or_dash(recent_top10)}. "
+                "All BUY recommendations have been downgraded to HOLD because "
+                "the model has no out-of-sample edge in this regime. "
+                "Re-train when the regime shifts."
+            )
+        elif regime == "unknown":
+            st.info(
+                "Walk-forward metrics for this model are not available — "
+                "skill gating is disabled (neutral 50% confidence ceiling). "
+                "Run **train** to generate fold metrics for this horizon."
+            )
+        else:
+            st.caption(
+                f"Model skill — recent IC: **{_fmt_ic_or_dash(recent_ic)}** · "
+                f"Top-10 spread: **{_fmt_pct_or_dash(recent_top10)}** · "
+                "regime: ok"
+            )
 
         # Warn when features are stale (older than 5 trading days)
         try:
@@ -859,13 +1140,54 @@ with tab_detail:
             card_cols[3].metric(
                 "Confidence",
                 f"{conf:.1f}%" if conf is not None else "—",
-                help="|sort_score sigma| / 3, capped at 100%.",
+                help=(
+                    "Composite percentile rescaled by recent walk-forward IC and "
+                    "Top-10 spread. Caps at 95% by construction; collapses to 0 in a "
+                    "low-skill regime."
+                ),
             )
             card_cols[4].metric(
                 "Risk",
                 _risk_level_from_lowvol_z(row.get("low_volatility_z")),
                 help="From low-volatility z-score component.",
             )
+
+            # ── Phase 4a: model-skill mini-cards ─────────────────────────
+            skill_cols = st.columns(3)
+            recent_ic_d = detail_payload.get("recent_ic")
+            recent_top10_d = detail_payload.get("recent_top10_spread")
+            hit_rate = row.get("hit_rate")
+            skill_cols[0].metric(
+                "Recent IC",
+                _fmt_ic_or_dash(recent_ic_d),
+                help="Mean Spearman IC over the last few walk-forward folds.",
+            )
+            skill_cols[1].metric(
+                "Top-10 spread (recent)",
+                _fmt_pct_or_dash(recent_top10_d),
+                help="Average forward return of the model's predicted top-10 minus the universe mean.",
+            )
+            skill_cols[2].metric(
+                "Stock hit-rate (last 100 picks)",
+                f"{hit_rate * 100:.1f}%" if hit_rate is not None else "—",
+                help="Historical share of times this stock outperformed the universe mean when picked as BUY.",
+            )
+
+            _render_yfinance_fundamentals_card(row)
+
+            # Reason banner if this row was downgraded
+            reason = row.get("reason")
+            if reason:
+                msg = {
+                    "momentum_disagreement": (
+                        "Model said up, but 63-day momentum is negative — "
+                        "downgraded to HOLD."
+                    ),
+                    "low_skill_regime": (
+                        "Low-skill regime active — all BUYs converted to HOLD."
+                    ),
+                }.get(reason, f"Reason: {reason}")
+                st.warning(msg)
 
             # ── Chart ─────────────────────────────────────────────────────
             ohlcv_path = _find_latest_ohlcv()
@@ -985,7 +1307,7 @@ with tab_detail:
 
             # ── Why explanation ───────────────────────────────────────────
             st.markdown("### Why this view")
-            bullets = _generate_why(row, raw_inds)
+            bullets = _generate_why(row, raw_inds, payload=detail_payload)
             if bullets:
                 for b in bullets:
                     st.markdown(f"- {b}")
@@ -1060,7 +1382,9 @@ with tab_pipeline:
                 f"python -m stock_knight.cli features-labels "
                 f"--data-root {shlex.quote(data_root)} "
                 f"--ohlcv-parquet {shlex.quote(str(ohlcv_path))}"
-                + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else ""),
+                + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
+                + _features_labels_sectors_arg(data_root)
+                + _yfinance_fl_flag(yfinance_fundamentals),
                 label="Features & Labels",
             )
             if ok:
@@ -1127,7 +1451,8 @@ with tab_pipeline:
                 f"--training-target {train_target}"
                 + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
                 + ltp_part
-                + f" --out {shlex.quote(str(out_path))}",
+                + f" --out {shlex.quote(str(out_path))}"
+                + _rank_cmd_extras(feat_path),
                 label="Ranking",
             )
             if ok:
