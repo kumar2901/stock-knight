@@ -42,6 +42,7 @@ def test_rank_for_date_emits_recommendation_and_confidence(
         rank_method="composite",
     )
 
+    assert ranks.prediction_is_fractional_return is True
     assert ranks.rank_method == "composite"
     assert ranks.composite_weights is not None
     assert len(ranks.rows) == len(ranks.ranked)
@@ -61,6 +62,7 @@ def test_rank_for_date_emits_recommendation_and_confidence(
     payload = json.loads(out_path.read_text())
     assert payload["rank_method"] == "composite"
     assert payload["composite_weights"]["expected_return"] == 0.40
+    assert payload.get("prediction_is_fractional_return") is True
     assert payload["rows"][0]["recommendation"] == "BUY"
 
 

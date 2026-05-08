@@ -312,6 +312,13 @@ def cmd_rank(args: argparse.Namespace) -> None:
         enable_momentum_gate=not getattr(args, "no_momentum_gate", False),
         enable_regime_gate=not getattr(args, "no_regime_gate", False),
         enable_hit_rate_gate=not getattr(args, "no_hit_rate_gate", False),
+        yfinance_fundamentals=bool(getattr(args, "yfinance_fundamentals", False)),
+        yfinance_delay_s=float(getattr(args, "yfinance_delay", 0.2)),
+        sectors_csv=(
+            Path(args.sectors_csv)
+            if getattr(args, "sectors_csv", None) and str(getattr(args, "sectors_csv", "")).strip()
+            else None
+        ),
     )
     write_ranklists(Path(args.out), ranks)
 
@@ -572,7 +579,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--training-target",
         default="raw",
         choices=["raw", "excess", "sector_residual"],
-        help="Metadata only: records which training target you used when producing this rank file.",
+        help=(
+            "Which label column the model was trained on. Must match the artifact "
+            "(e.g. excess → artifacts/models/<kind>_<horizon>_excess.joblib). "
+            "Also stored as metadata in the rank JSON."
+        ),
     )
     rk.add_argument(
         "--benchmark-symbol",
@@ -645,6 +656,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-hit-rate-gate",
         action="store_true",
         help="Disable Phase-3c per-stock hit-rate suppression (debug only).",
+    )
+    rk.add_argument(
+        "--yfinance-fundamentals",
+        action="store_true",
+        help=(
+            "Fetch Yahoo P/E, P/B, dividend yield, balance-sheet metrics for this rank date "
+            "and attach to output (UI). Does not require fundamentals in the features parquet; "
+            "slower (~0.2s/symbol). Use with --sectors-csv for sector-relative columns."
+        ),
+    )
+    rk.add_argument(
+        "--yfinance-delay",
+        type=float,
+        default=0.2,
+        help="Seconds between Yahoo requests when --yfinance-fundamentals is set.",
+    )
+    rk.add_argument(
+        "--sectors-csv",
+        default="data/sectors.csv",
+        help=(
+            "Used only with --yfinance-fundamentals: sector map for vs-sector spreads. "
+            "Pass empty string to disable."
+        ),
     )
     rk.set_defaults(func=cmd_rank)
 

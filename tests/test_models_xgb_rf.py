@@ -52,3 +52,12 @@ def test_save_and_load_roundtrip(
     np.testing.assert_allclose(
         loaded.predict(X.head(20)), tm.predict(X.head(20)), rtol=1e-6
     )
+
+
+def test_predictions_are_fractional_returns_by_kind() -> None:
+    ridge = TrainedModel(kind="ridge", horizon="1d", feature_cols=["a_z"], model=None)
+    assert ridge.predictions_are_fractional_returns() is True
+    ranker = TrainedModel(kind="lgbm_rank", horizon="7d", feature_cols=["a_z"], model=None)
+    assert ranker.predictions_are_fractional_returns() is False
+    ens = TrainedModel(kind="ensemble", horizon="7d", feature_cols=["a_z"], model={}, member_kinds=["ridge"])
+    assert ens.predictions_are_fractional_returns() is False

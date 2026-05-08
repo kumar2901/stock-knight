@@ -81,6 +81,15 @@ def _balance_sheet_metrics(ticker: Any) -> dict[str, float | None]:
         cl = _pick_bs(bs, ("Current Liabilities", "Total Current Liabilities"), c0)
         if ca is not None and cl is not None and cl != 0:
             out["yf_current_ratio_bs"] = ca / cl
+        if out["yf_current_ratio_bs"] is None:
+            # Many NSE names omit currentRatio in ``info``; Yahoo may only expose
+            # Working Capital + Current Liabilities (CA/CL = 1 + WC/CL).
+            wc = _pick_bs(bs, ("Working Capital",), c0)
+            cl_wc = cl if cl is not None else _pick_bs(
+                bs, ("Current Liabilities", "Total Current Liabilities"), c0
+            )
+            if wc is not None and cl_wc is not None and cl_wc != 0:
+                out["yf_current_ratio_bs"] = 1.0 + (wc / cl_wc)
 
         debt = _pick_bs(
             bs,
@@ -101,6 +110,49 @@ def _balance_sheet_metrics(ticker: Any) -> dict[str, float | None]:
     except Exception as e:  # pragma: no cover
         _log.debug("balance_sheet parse skip: %s", e)
     return out
+
+
+def _roe_from_statements(ticker: Any) -> float | None:
+    """ROE = net income / equity from latest annual statements if ``info`` omits ROE."""
+    try:
+        fin = ticker.financials
+        bs = ticker.balance_sheet
+        if fin is None or fin.empty or bs is None or bs.empty:
+            return None
+        fc = fin.columns[0]
+        bc = bs.columns[0]
+        ni: float | None = None
+        for name in (
+            "Net Income Common Stockholders",
+            "Net Income",
+            "Net Income From Continuing Operation Net Minority Interest",
+        ):
+            if name not in fin.index:
+                continue
+            v = fin.loc[name, fc]
+            if pd.notna(v):
+                ni = float(v)
+                break
+        eq: float | None = None
+        for name in (
+            "Stockholders Equity",
+            "Common Stock Equity",
+            "Total Stockholder Equity",
+        ):
+            if name not in bs.index:
+                continue
+            v = bs.loc[name, bc]
+            if pd.notna(v):
+                e0 = float(v)
+                if e0 != 0:
+                    eq = e0
+                    break
+        if ni is None or eq is None:
+            return None
+        return ni / abs(eq)
+    except Exception as e:  # pragma: no cover
+        _log.debug("roe_from_statements skip: %s", e)
+        return None
 
 
 def fetch_fundamentals_yfinance(
@@ -162,8 +214,18 @@ def fetch_fundamentals_yfinance(
             row["yf_profit_margin"] = float(pm) if pm is not None and pd.notna(pm) else np.nan
 
             bm = _balance_sheet_metrics(t)
-            row["yf_current_ratio_bs"] = bm.get("yf_current_ratio_bs") or np.nan
-            row["yf_debt_to_equity_bs"] = bm.get("yf_debt_to_equity_bs") or np.nan
+            crbs = bm.get("yf_current_ratio_bs")
+            debs = bm.get("yf_debt_to_equity_bs")
+            row["yf_current_ratio_bs"] = np.nan if crbs is None else float(crbs)
+            row["yf_debt_to_equity_bs"] = np.nan if debs is None else float(debs)
+
+            # NSE ``Ticker.info`` often omits currentRatio / returnOnEquity; backfill from statements.
+            if pd.isna(row["yf_current_ratio"]) and crbs is not None:
+                row["yf_current_ratio"] = float(crbs)
+            if pd.isna(row["yf_roe"]):
+                roe_fb = _roe_from_statements(t)
+                if roe_fb is not None:
+                    row["yf_roe"] = roe_fb
         except Exception as e:
             _log.warning("yfinance failed for %s (%s): %s", sym, ysym, e)
 
@@ -192,16 +254,24 @@ def merge_fundamentals_into_features(
     out = feats.copy()
     lvl1 = out.index.get_level_values(1).astype(str).str.upper()
     lvl0 = out.index.get_level_values(0)
+    lvl1_list = lvl1.tolist()
 
     for c in _RAW_COLS:
         if c not in fund.columns:
             continue
-        out[c] = fund[c].reindex(lvl1).to_numpy()
+        ser = fund[c]
+        if ser.index.has_duplicates:
+            ser = ser[~ser.index.duplicated(keep="last")]
+        fd = ser.to_dict()
+        out[c] = [fd.get(s, np.nan) for s in lvl1_list]
 
     if sector_map is not None and not sector_map.empty:
         sm = sector_map.copy()
         sm.index = sm.index.astype(str).str.upper()
-        sec = sm.reindex(lvl1).fillna("Others").to_numpy()
+        if sm.index.has_duplicates:
+            sm = sm[~sm.index.duplicated(keep="last")]
+        sdict = sm.to_dict()
+        sec = np.array([sdict.get(s, "Others") for s in lvl1_list])
 
         def rel(col: str, outn: str) -> None:
             if col not in out.columns:
@@ -252,3 +322,31 @@ def enrich_features_with_yfinance(
     symbols = feats.index.get_level_values(1).unique().tolist()
     fund = fetch_fundamentals_yfinance(symbols, delay_s=delay_s)
     return merge_fundamentals_into_features(feats, fund, sector_map=sector_map)
+
+
+def enrich_day_slice_with_yfinance(
+    day: pd.DataFrame,
+    asof: pd.Timestamp,
+    *,
+    sector_map: pd.Series | None = None,
+    delay_s: float = _DEFAULT_DELAY_S,
+) -> pd.DataFrame:
+    """Attach Yahoo fundamentals to a **single-date** feature slice (symbol index).
+
+    Used by ``rank_for_date`` when ``--yfinance-fundamentals`` is set so the rank
+    file and UI show ratios **without** rebuilding the full features parquet.
+    Cross-sectional z-scores are taken **within this day's cohort** only.
+    """
+    if day.empty:
+        return day
+    asof_n = pd.to_datetime(asof).tz_localize(None).normalize()
+    syms = day.index.astype(str)
+    fund = fetch_fundamentals_yfinance(syms.tolist(), delay_s=delay_s)
+    multi = day.copy()
+    multi.index = pd.MultiIndex.from_arrays(
+        [np.repeat(asof_n, len(multi)), syms.to_numpy()],
+        names=["date", "symbol"],
+    )
+    merged = merge_fundamentals_into_features(multi, fund, sector_map=sector_map)
+    out = merged.xs(asof_n, level=0)
+    return out.reindex(day.index)

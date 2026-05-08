@@ -99,6 +99,7 @@ def compute_composite(
     predicted_return: pd.Series,
     features_day: pd.DataFrame,
     weights: CompositeWeights | None = None,
+    include_sharpe_component: bool = True,
 ) -> RankComponents:
     """
     Compute the composite ranking score for a single as-of date.
@@ -116,6 +117,10 @@ def compute_composite(
           - `mom_63d` (raw) or `mom_63d_z` for the momentum component.
     weights
         Optional override; defaults to `CompositeWeights()`.
+    include_sharpe_component
+        When False, the Sharpe term contributes zero. Use when model outputs
+        are rank scores or rank-percentiles, not fractional returns —
+        ``pred / vol`` would be meaningless in those units.
 
     Returns
     -------
@@ -148,9 +153,12 @@ def compute_composite(
     # legacy ~10x amplification, which was the primary driver of defensive
     # names (pharma/telecom) dominating the Top-K list regardless of the
     # underlying prediction quality.
-    denom, _mode = _sharpe_denominator(features_day, pred.index)
-    sharpe = pred / denom
-    sharpe_z = _zscore(sharpe)
+    if include_sharpe_component:
+        denom, _mode = _sharpe_denominator(features_day, pred.index)
+        sharpe = pred / denom
+        sharpe_z = _zscore(sharpe)
+    else:
+        sharpe_z = pd.Series(0.0, index=pred.index, dtype=float)
 
     low_vol_component = -vol_z
 

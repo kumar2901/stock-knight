@@ -19,6 +19,8 @@ from stock_knight.ranking.skill_gate import (
     per_symbol_hit_rate,
     regime_flag,
 )
+from stock_knight.data.sectors import load_sector_map
+from stock_knight.features.fundamentals_yfinance import enrich_day_slice_with_yfinance
 from stock_knight.storage import read_df_parquet, write_json
 from stock_knight.train.models import TrainedModel, load_model
 
@@ -47,6 +49,7 @@ class RankLists:
     recent_ic: float | None = None  # mean Spearman IC of last few walk-forward folds
     recent_top10_spread: float | None = None  # mean Top-10 spread of same folds
     skill_source: str | None = None  # path to *_metrics.json consulted
+    prediction_is_fractional_return: bool = True  # False for lgbm_rank / ensemble
 
 
 def rank_for_date(
@@ -68,6 +71,9 @@ def rank_for_date(
     enable_momentum_gate: bool = True,
     enable_regime_gate: bool = True,
     enable_hit_rate_gate: bool = True,
+    yfinance_fundamentals: bool = False,
+    yfinance_delay_s: float = 0.2,
+    sectors_csv: Path | None = None,
 ) -> RankLists:
     feats = read_df_parquet(features_parquet)
     asof = pd.to_datetime(asof).tz_localize(None)
@@ -112,6 +118,7 @@ def rank_for_date(
         day = day[~day.index.duplicated(keep="first")]
 
     tm: TrainedModel = load_model(model_path)
+    pred_is_fr = tm.predictions_are_fractional_returns()
     if min_non_na:
         day_full = day.dropna(subset=tm.feature_cols)
         if len(day_full) == 0:
@@ -154,6 +161,16 @@ def rank_for_date(
     if len(day) == 0:
         raise ValueError(f"No feature rows available for {asof.date()}")
 
+    if yfinance_fundamentals:
+        smap = load_sector_map(sectors_csv)
+        day = day.drop(columns=[c for c in day.columns if str(c).startswith("yf_")], errors="ignore")
+        day = enrich_day_slice_with_yfinance(
+            day,
+            asof,
+            sector_map=smap if not smap.empty else None,
+            delay_s=yfinance_delay_s,
+        )
+
     pred = tm.predict(day)
     pred_series = pd.Series(pred, index=day.index, name="predicted_return")
 
@@ -169,6 +186,7 @@ def rank_for_date(
             predicted_return=pred_series,
             features_day=day,
             weights=weights_used,
+            include_sharpe_component=pred_is_fr,
         )
         sort_key = components.composite
     else:
@@ -300,13 +318,17 @@ def rank_for_date(
     rows: list[dict] = []
     for sym, sort_score in scores.items():
         cp = float(asof_close.loc[sym]) if sym in asof_close.index else None
-        # `predicted_return` always comes from the model (used for target price).
-        # Fall back to the sort score if a symbol somehow isn't in pred_series
-        # (shouldn't happen post-dedupe, but be defensive).
+        # `predicted_return` is the raw model output (fractional return for ridge/lgbm/…,
+        # or a rank score for lgbm_rank / ensemble). Target prices use it only when
+        # it is in return units; see `prediction_is_fractional_return` in the payload.
         pr = float(pred_series.loc[sym]) if sym in pred_series.index else float(sort_score)
-        tp = (cp * (1.0 + pr)) if cp is not None else None
         ltp = float(ltp_map[sym]) if sym in ltp_map else None
-        ltp_tgt = (ltp * (1.0 + pr)) if ltp is not None else None
+        if pred_is_fr:
+            tp = (cp * (1.0 + pr)) if cp is not None else None
+            ltp_tgt = (ltp * (1.0 + pr)) if ltp is not None else None
+        else:
+            tp = None
+            ltp_tgt = None
         row = {
             "symbol": sym,
             "predicted_return": pr,
@@ -377,6 +399,7 @@ def rank_for_date(
             None if skill.is_unknown else float(skill.recent_top10)
         ),
         skill_source=skill.source,
+        prediction_is_fractional_return=pred_is_fr,
     )
 
 
@@ -396,6 +419,7 @@ def write_ranklists(out_path: Path, ranks: RankLists) -> None:
             "recent_ic": ranks.recent_ic,
             "recent_top10_spread": ranks.recent_top10_spread,
             "skill_source": ranks.skill_source,
+            "prediction_is_fractional_return": ranks.prediction_is_fractional_return,
             "ranked": ranks.ranked,
             "rows": ranks.rows,
             "top10": ranks.top10,

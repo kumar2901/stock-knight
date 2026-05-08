@@ -131,3 +131,20 @@ def test_sharpe_falls_back_gracefully_without_raw_vol() -> None:
     # All finite, same length.
     assert np.isfinite(components.sharpe_z).all()
     assert len(components.composite) == len(syms)
+
+
+def test_composite_omits_sharpe_when_disabled() -> None:
+    syms = [f"S{i}" for i in range(10)]
+    pred = pd.Series(np.linspace(-0.02, 0.02, len(syms)), index=syms)
+    feats = pd.DataFrame(
+        {
+            "vol_21d": np.full(len(syms), 0.02),
+            "vol_21d_z": np.zeros(len(syms)),
+            "mom_63d": np.zeros(len(syms)),
+        },
+        index=pd.Index(syms, name="symbol"),
+    )
+    c_on = compute_composite(predicted_return=pred, features_day=feats, include_sharpe_component=True)
+    c_off = compute_composite(predicted_return=pred, features_day=feats, include_sharpe_component=False)
+    assert (c_off.sharpe_z == 0.0).all()
+    assert not np.allclose(c_on.composite, c_off.composite)

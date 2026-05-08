@@ -163,6 +163,8 @@ python -m stock_knight.cli rank \
   --out reports/ranks_1d_2025-12-30.json
 ```
 
+To attach **Yahoo fundamentals** to the rank JSON / Stock Detail **without** rebuilding the features parquet, add `--yfinance-fundamentals` (and optionally `--sectors-csv data/sectors.csv` for sector-relative columns). Expect ~0.2s per symbol.
+
 Optional: run the MVP cost-aware backtest (1D PnL accounting):
 
 ```bash

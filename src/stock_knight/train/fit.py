@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from stock_knight.storage import DataPaths, read_df_parquet, write_json
+from stock_knight.train.artifact_names import model_artifact_path
 from stock_knight.train.models import (
     TrainedModel,
     save_model,
@@ -161,10 +162,10 @@ def train_walk_forward(
 
         final_tm = _fit_model(model_kind, hdf, hdf[ycol], horizon=h)
 
-        model_path = out_dir / f"{model_kind}_{h}.joblib"
+        model_path = model_artifact_path(out_dir, model_kind, h, target)
         save_model(model_path, final_tm)
 
-        metrics_path = out_dir / f"{model_kind}_{h}_metrics.json"
+        metrics_path = out_dir / f"{model_path.stem}_metrics.json"
         write_json(metrics_path, {"horizon": h, "model_kind": model_kind, "folds": fold_metrics})
 
         results.append(TrainResult(model_path=model_path, metrics_path=metrics_path))

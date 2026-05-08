@@ -17,6 +17,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from stock_knight.train.artifact_names import model_artifact_path, model_artifact_stem
+
 st.set_page_config(
     page_title="Stock Knight ♞",
     page_icon="♞",
@@ -71,7 +73,7 @@ with st.sidebar:
     yfinance_fundamentals = st.checkbox(
         "Yahoo fundamentals (yfinance)",
         value=False,
-        help="Adds P/E, P/B, dividend yield, balance-sheet ratios to features. Slow (~0.2s/symbol); install yfinance. Retrain models after enabling.",
+        help="Adds P/E, P/B, dividend yield, balance-sheet ratios. Fetches during **features build** and, in this app, also during **Re-Rank** so Stock Detail shows ratios without rebuilding features. Install yfinance. Retrain models if you want these z-scores in the model.",
     )
 
     # Benchmark index options per broker — only verified/eligible tickers listed.
@@ -218,6 +220,46 @@ _YF_RAW_SPECS: list[tuple[str, str, str]] = [
     ("yf_debt_to_equity_bs", "Debt / equity (balance sheet)", "num"),
 ]
 
+# Per-metric ⓘ tooltips — interpretation for analysis (not definitions).
+_YF_RAW_METRIC_HELP: dict[str, str] = {
+    "yf_trailing_pe": (
+        "Lower multiple: usually cheaper vs trailing earnings (value tilt). "
+        "Higher multiple: market pays more per rupee of past earnings (growth priced in, "
+        "quality premium, or expensive / depressed EPS—check if earnings are unusually low). "
+        "Compare to sector peers and history; cheap is not automatically better if quality is poor."
+    ),
+    "yf_forward_pe": (
+        "Lower: typically cheaper vs expected future EPS (good for value screens if forecasts "
+        "are credible). Higher: you pay more per rupee of forecast earnings (growth, optimism, "
+        "or stretched). If forward P/E is much lower than TTM P/E, the market may expect EPS "
+        "to recover; if forward is higher than TTM, it may expect earnings to shrink. "
+        "Forward coverage can be thin for some Indian names."
+    ),
+    "yf_pb": (
+        "Lower: closer to book value (value signal in banks/industrials; can also mean weak "
+        "ROE or distress). Higher: normal for asset-light growers; for heavy-asset sectors "
+        "a high P/B can mean strong franchise—or paying too much. Compare only within the same sector."
+    ),
+    "yf_current_ratio": (
+        "Higher (often ~1.2+ depending on sector): usually more short-term liquidity and "
+        "room to meet obligations—helpful for stress checks. Very high: possible idle cash. "
+        "Below ~1: often worth investigating vs peers. Use trend and industry norms, not one number."
+    ),
+    "yf_debt_to_equity": (
+        "Lower: generally better for risk (less leverage, less sensitivity to rates and "
+        "downturns). Higher: can magnify returns in good times but worsens downside and "
+        "refinancing risk. Interpret vs sector norms. Source: Yahoo's ratio, may differ from filings."
+    ),
+    "yf_current_ratio_bs": (
+        "Same interpretation as Current ratio (higher usually safer liquidity; very high vs "
+        "too low). This value is derived from Yahoo balance-sheet fields when used."
+    ),
+    "yf_debt_to_equity_bs": (
+        "Same interpretation as Debt / equity (lower usually less risky leverage). "
+        "Compare to the headline Yahoo line and peers for consistency."
+    ),
+}
+
 _YF_SECTOR_SPECS: list[tuple[str, str, str]] = [
     ("yf_pe_vs_sector", "P/E − sector median", "spread"),
     ("yf_pb_vs_sector", "P/B − sector median", "spread"),
@@ -242,14 +284,17 @@ _YF_Z_SPECS: list[tuple[str, str]] = [
 
 
 def _render_yfinance_fundamentals_card(row: dict) -> None:
+    st.markdown("### Fundamentals (Yahoo Finance)")
+
     if not any(k.startswith("yf_") for k in row):
         st.info(
-            "No Yahoo fundamentals in this rank file. Rebuild features with "
-            "**--yfinance-fundamentals** (or enable the sidebar checkbox), then **re-rank**."
+            "No Yahoo fundamentals on this row. Either run **rank** with "
+            "**`--yfinance-fundamentals`** (and optional **`--sectors-csv`**), or rebuild "
+            "features with **`--yfinance-fundamentals`** then re-rank. "
+            "The sidebar checkbox adds this to **Re-Rank** in this app only when you click it."
         )
         return
 
-    st.markdown("### Fundamentals (Yahoo Finance)")
     st.caption(
         "Snapshot aligned to your features parquet when it was built. "
         "**Sector** columns compare this stock to the median of its sector on the same date. "
@@ -268,7 +313,11 @@ def _render_yfinance_fundamentals_card(row: dict) -> None:
             txt = _fmt_yf_div_yield(v)
         else:
             txt = _fmt_yf_pct_ratio(v)
-        rc[ri % 5].metric(label, txt)
+        mh = _YF_RAW_METRIC_HELP.get(key)
+        if mh:
+            rc[ri % 5].metric(label, txt, help=mh)
+        else:
+            rc[ri % 5].metric(label, txt)
         ri += 1
 
     if any(spec[0] in row for spec in _YF_SECTOR_SPECS):
@@ -393,9 +442,99 @@ def _yfinance_fl_flag(enabled: bool) -> str:
     return " --yfinance-fundamentals" if enabled else ""
 
 
-def _find_model(kind: str, horizon: str) -> Path | None:
-    p = Path("artifacts") / "models" / f"{kind}_{horizon}.joblib"
-    return p if p.exists() else None
+def _yfinance_rank_extras(enabled: bool, data_root_str: str) -> str:
+    """Append ``rank`` flags so Yahoo ratios appear without rebuilding features."""
+    if not enabled:
+        return ""
+    parts = ["--yfinance-fundamentals"]
+    sec = _sectors_csv_path(data_root_str)
+    if sec is not None:
+        parts.append(f"--sectors-csv {shlex.quote(str(sec.resolve()))}")
+    return " " + " ".join(parts)
+
+
+def _find_model(kind: str, horizon: str, training_target: str) -> Path | None:
+    """Resolve ``artifacts/models/{stem}.joblib`` for the training target.
+
+    Non-raw targets use a suffix (e.g. ``lgbm_7d_excess.joblib``). If that file
+    is missing, fall back to the legacy ``{kind}_{horizon}.joblib`` path so older
+    workflows keep working; the UI warns when the legacy path is used.
+    """
+    root = Path("artifacts") / "models"
+    primary = model_artifact_path(root, kind, horizon, training_target)
+    if primary.exists():
+        return primary
+    if training_target != "raw":
+        legacy = root / f"{kind}_{horizon}.joblib"
+        if legacy.exists():
+            return legacy
+    return None
+
+
+def _model_is_legacy_path(model_path: Path, kind: str, horizon: str, training_target: str) -> bool:
+    return training_target != "raw" and model_path.stem == f"{kind}_{horizon}"
+
+
+def _model_file_exists_for_ui(kind: str, horizon: str, training_target: str) -> bool:
+    """True if a joblib exists for training (primary or legacy path)."""
+    p = _find_model(kind, horizon, training_target)
+    return p is not None
+
+
+def _stem_matches_horizon(stem: str, horizon: str) -> bool:
+    return (
+        stem.endswith(f"_{horizon}_sector_residual")
+        or stem.endswith(f"_{horizon}_excess")
+        or stem.endswith(f"_{horizon}")
+    )
+
+
+def _render_missing_model_help(kind: str, horizon: str, training_target: str) -> None:
+    """Explain a missing model file: train first vs wrong Model / target / horizon in sidebar."""
+    root = Path("artifacts") / "models"
+    expect = model_artifact_stem(kind, horizon, training_target)
+    st.error(
+        f"Model not found: **`artifacts/models/{expect}.joblib`**. "
+        "Run **Pipeline → Step 3 — Train** with the same **Model**, **Training target**, and "
+        "**Horizon** you use for ranking (or pick an existing file below)."
+    )
+    if not root.is_dir():
+        st.info("Folder `artifacts/models/` does not exist yet — complete training once to create it.")
+        return
+
+    joblibs = sorted(root.glob("*.joblib"))
+    if not joblibs:
+        st.info("No `.joblib` files in `artifacts/models/`. Run **Pipeline → Step 3 — Train**.")
+        return
+
+    for other_target in ("raw", "excess", "sector_residual"):
+        if other_target == training_target:
+            continue
+        alt = model_artifact_path(root, kind, horizon, other_target)
+        if alt.exists():
+            st.warning(
+                f"**Training target mismatch:** found `{alt.name}` but the sidebar expects "
+                f"`{expect}.joblib` (target **{training_target}**). "
+                f"Set **Training target** to **{other_target}** in the sidebar, or retrain with **{training_target}**."
+            )
+            break
+
+    same_h = [p for p in joblibs if _stem_matches_horizon(p.stem, horizon)]
+    other_same_horizon = sorted(
+        p.name for p in same_h if p.stem != expect
+    )
+    if other_same_horizon:
+        shown = other_same_horizon[:12]
+        more = f" (+{len(other_same_horizon) - 12} more)" if len(other_same_horizon) > 12 else ""
+        st.info(
+            "Other models for this **horizon**: "
+            + ", ".join(f"`{n}`" for n in shown)
+            + more
+            + f" — adjust **Model** / **Training target** / **Horizon**, or train **`{expect}.joblib`**."
+        )
+
+    with st.expander("All saved models (`artifacts/models/`)"):
+        st.code("\n".join(p.name for p in joblibs), language="text")
 
 
 def _latest_rank_date(features_path: Path) -> date | None:
@@ -438,6 +577,7 @@ def _build_rank_df(payload: dict, top_k: int, show_bottom: bool = False) -> pd.D
     ranked: list[str] = payload.get("ranked") or []
     rows_raw: list[dict] = payload.get("rows") or []
     row_map = {r.get("symbol"): r for r in rows_raw if r.get("symbol")}
+    pred_is_fr = payload.get("prediction_is_fractional_return", True)
 
     symbols = list(reversed(ranked[-top_k:])) if show_bottom else ranked[:top_k]
 
@@ -448,19 +588,21 @@ def _build_rank_df(payload: dict, top_k: int, show_bottom: bool = False) -> pd.D
         ltp = r.get("live_ltp")
         asof_close = r.get("asof_close")
         target = r.get("live_target_price") or r.get("asof_target_price")
-        records.append(
-            {
-                "Rank": i,
-                "Symbol": sym,
-                "Live LTP ₹": round(ltp, 2) if ltp else None,
-                "Close (asof) ₹": round(asof_close, 2) if asof_close else None,
-                "Predicted Return %": round(pr * 100, 2) if pr is not None else None,
-                "Target Price ₹": round(target, 2) if target else None,
-                "Reco": r.get("recommendation") or "—",
-                "Confidence %": r.get("confidence_pct"),
-                "Risk": _risk_level_from_lowvol_z(r.get("low_volatility_z")),
-            }
-        )
+        base = {
+            "Rank": i,
+            "Symbol": sym,
+            "Live LTP ₹": round(ltp, 2) if ltp else None,
+            "Close (asof) ₹": round(asof_close, 2) if asof_close else None,
+            "Target Price ₹": round(target, 2) if target else None,
+            "Reco": r.get("recommendation") or "—",
+            "Confidence %": r.get("confidence_pct"),
+            "Risk": _risk_level_from_lowvol_z(r.get("low_volatility_z")),
+        }
+        if pred_is_fr:
+            base["Predicted Return %"] = round(float(pr) * 100, 2) if pr is not None else None
+        else:
+            base["Model score"] = round(float(pr), 6) if pr is not None else None
+        records.append(base)
     return pd.DataFrame(records)
 
 
@@ -471,6 +613,7 @@ def _apply_rank_filters(
     risk_filter: str,
     pr_min: float,
     pr_max: float,
+    apply_return_pct_filter: bool = True,
 ) -> pd.DataFrame:
     """Apply the Rankings-tab filters to a display DataFrame."""
     out = df
@@ -478,7 +621,7 @@ def _apply_rank_filters(
         out = out[out["Reco"] == reco_filter]
     if risk_filter and risk_filter != "All":
         out = out[out["Risk"] == risk_filter]
-    if "Predicted Return %" in out.columns:
+    if apply_return_pct_filter and "Predicted Return %" in out.columns:
         out = out[
             (out["Predicted Return %"].fillna(0) >= pr_min)
             & (out["Predicted Return %"].fillna(0) <= pr_max)
@@ -620,7 +763,13 @@ def _generate_why(row: dict, raw: dict, payload: dict | None = None) -> list[str
 
     pr = row.get("predicted_return")
     if pr is not None:
-        bullets.append(f"Model predicts {pr * 100:+.2f}% forward return.")
+        pred_is_fr = True if payload is None else bool(payload.get("prediction_is_fractional_return", True))
+        if pred_is_fr:
+            bullets.append(f"Model predicts {float(pr) * 100:+.2f}% forward return.")
+        else:
+            bullets.append(
+                f"Model rank score = {float(pr):+.4f} (ordering signal only; not a percent return)."
+            )
 
     hit = row.get("hit_rate")
     if hit is not None:
@@ -629,6 +778,59 @@ def _generate_why(row: dict, raw: dict, payload: dict | None = None) -> list[str
         )
 
     return bullets[:7]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Home — guidance before tabs
+# ═════════════════════════════════════════════════════════════════════════════
+st.markdown("### Welcome")
+st.caption(
+    "Use the sidebar for broker, data, **Model**, and **Training target**. "
+    "Then open the tabs below for rankings, stock detail, pipeline, and trading."
+)
+
+with st.expander("Choosing model, training target & horizon", expanded=False):
+    st.markdown(
+        """
+**What “accurate” means here** depends on your goal: absolute return, beating the index,
+or ranking names within a fair peer set. Match **target** and **model** to that goal.
+
+##### Training target
+
+| Target | Meaning | When to use |
+|--------|---------|-------------|
+| **Raw** | Predict total forward return | Simple baseline; you care about **absolute** movement. |
+| **Excess** | Return vs your **benchmark** (sidebar) | You care about **beating the index**; needs benchmark in ingest / features. |
+| **Sector residual** | Return vs that day’s **sector** median | Often strong for **cross-sectional ranking**; needs `data/sectors.csv` and labels built with sectors. |
+
+**Starting points:** sector residual or excess for levelled comparisons; raw if you want the simplest label.
+
+##### Model kind
+
+| Model | Role | When to use |
+|--------|------|-------------|
+| **Ridge** | Linear on z-features | Sanity check / limited history. |
+| **LGBM** | Nonlinear regression on **returns** | Solid default with enough history; clear return-like outputs. |
+| **lgbm_rank** | LambdaRank — optimizes **ordering** within each day | Strong when **who’s on top** matters (often **7d / 1m**). |
+| **XGB / RF** | Alternatives to LGBM | If you want to compare tree ensembles. |
+| **Ensemble** | Blends members in **rank space** | Robust **ordering**; outputs are scores, not % returns. |
+
+**Starting points:** **lgbm_rank** or **ensemble** for short horizons focused on lists; **LGBM** with the same target if you want **target prices** tied to return predictions.
+
+##### Horizon
+
+- **1d** — very noisy; expect weak stability.
+- **7d / 1m** — usual sweet spot for this style of system.
+- **6m / 12m** — need long, clean feature history; avoid short feature parquets.
+
+##### Rankings tab
+
+- **Sort key → score only** aligns the list with raw **walk-forward IC** style ordering.
+- **Composite** intentionally mixes momentum and volatility tilts with the model.
+
+**After changing target or model**, retrain (Pipeline) so artifacts match (`*_excess.joblib`, etc.).
+"""
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -644,17 +846,29 @@ tab_rank, tab_detail, tab_pipeline, tab_trading = st.tabs(
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_rank:
     st.header("Stock Rankings")
-    st.caption("Stocks ranked by predicted return. Live LTP fetched from selected broker.")
+    st.caption(
+        "Choose **Sort key**: composite blends the model with momentum/low-vol tilts; "
+        "**score only** sorts by raw model output (same family as walk-forward IC). "
+        "Live LTP when enabled."
+    )
 
     # ── Controls row ──────────────────────────────────────────────────────
-    rc1, rc2, rc3, rc4 = st.columns([2, 2, 2, 4])
+    rc1, rc2, rc3, rc4, rc5 = st.columns([1.5, 1.5, 1.3, 1.3, 3.4])
     with rc1:
         rank_horizon = st.selectbox("Horizon", ["1d", "7d", "1m", "6m", "12m"], index=1, key="rank_horizon")
     with rc2:
-        top_k = st.selectbox("Show Top K", [10, 20, 30, 100], index=1, key="rank_topk")
+        rank_sort_method = st.selectbox(
+            "Sort key",
+            ["composite", "score_only"],
+            index=0,
+            help="Composite weights model output with Sharpe/momentum/vol/confidence. Score only uses the model predictor alone.",
+            key="rank_sort_method",
+        )
     with rc3:
-        show_bottom = st.checkbox("Show Bottom K too", value=False)
+        top_k = st.selectbox("Show Top K", [10, 20, 30, 100], index=1, key="rank_topk")
     with rc4:
+        show_bottom = st.checkbox("Show Bottom K too", value=False)
+    with rc5:
         fetch_ltp = st.checkbox(
             "Fetch live LTP",
             value=broker in {"yahoo", "angelone", "upstox", "zerodha"},
@@ -757,12 +971,16 @@ with tab_rank:
                         # Patch the payload rows with fresh LTP
                         from datetime import UTC, datetime as _dt
                         now_utc = _dt.now(UTC).replace(microsecond=0).isoformat()
+                        pred_is_fr = bool(payload_raw.get("prediction_is_fractional_return", True))
                         for row in payload_raw.get("rows", []):
                             sym = row.get("symbol", "")
                             if sym in ltp_map:
-                                pr = row.get("predicted_return", 0) or 0
                                 row["live_ltp"] = ltp_map[sym]
-                                row["live_target_price"] = ltp_map[sym] * (1 + pr)
+                                if pred_is_fr:
+                                    pr = float(row.get("predicted_return") or 0.0)
+                                    row["live_target_price"] = ltp_map[sym] * (1.0 + pr)
+                                else:
+                                    row["live_target_price"] = None
                         payload_raw["live_ltp_fetched_at"] = now_utc
                         payload_raw["live_ltp_broker"] = broker
                         ltp_rank_path.write_text(json.dumps(payload_raw, indent=2))
@@ -775,8 +993,9 @@ with tab_rank:
     if refresh_btn or quick_btn:
         feat_path = _find_latest_features()
         ohlcv_path = _find_latest_ohlcv()
-        model_path = _find_model(model_kind, rank_horizon)
+        model_path = _find_model(model_kind, rank_horizon, train_target)
         syms_file = _resolve_symbols_file()
+        rank_blocked = False
 
         # ── Quick Update: re-ingest last 6 months ─────────────────────
         if quick_btn:
@@ -784,77 +1003,93 @@ with tab_rank:
             quick_end = date.today().isoformat()
             if broker in {"yahoo"} and syms_file is None:
                 st.error("Symbols file required for Yahoo broker.")
-                st.stop()
-            extra = f" --symbols-file {shlex.quote(str(syms_file))}" if syms_file else ""
-            ok = _run(
-                f"python -m stock_knight.cli ingest --broker {shlex.quote(broker)} "
-                f"--data-root {shlex.quote(data_root)} "
-                f"--start {quick_start} --end {quick_end}"
-                f"{_creds_flag()}{extra}"
-                + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else ""),
-                label="Re-ingesting last 6 months",
-            )
-            if not ok:
-                st.stop()
-            # Rebuild features from the full existing OHLCV
-            ohlcv_path = _find_latest_ohlcv()
-            if ohlcv_path:
+                rank_blocked = True
+            else:
+                extra = f" --symbols-file {shlex.quote(str(syms_file))}" if syms_file else ""
                 ok = _run(
-                    f"python -m stock_knight.cli features-labels "
+                    f"python -m stock_knight.cli ingest --broker {shlex.quote(broker)} "
                     f"--data-root {shlex.quote(data_root)} "
-                    f"--ohlcv-parquet {shlex.quote(str(ohlcv_path))}"
-                    + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
-                    + _features_labels_sectors_arg(data_root)
-                    + _yfinance_fl_flag(yfinance_fundamentals),
-                    label="Rebuilding features",
+                    f"--start {quick_start} --end {quick_end}"
+                    f"{_creds_flag()}{extra}"
+                    + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else ""),
+                    label="Re-ingesting last 6 months",
                 )
                 if not ok:
-                    st.stop()
-                feat_path = _find_latest_features()
-                ohlcv_path = _find_latest_ohlcv()
-                # Re-detect latest asof
-                if feat_path:
-                    auto_asof = _latest_rank_date(feat_path)
-                    if auto_asof:
-                        rank_asof = auto_asof
-            else:
-                st.warning("No OHLCV data found after re-ingest.")
+                    rank_blocked = True
+                else:
+                    # Rebuild features from the full existing OHLCV
+                    ohlcv_path = _find_latest_ohlcv()
+                    if ohlcv_path:
+                        ok = _run(
+                            f"python -m stock_knight.cli features-labels "
+                            f"--data-root {shlex.quote(data_root)} "
+                            f"--ohlcv-parquet {shlex.quote(str(ohlcv_path))}"
+                            + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
+                            + _features_labels_sectors_arg(data_root)
+                            + _yfinance_fl_flag(yfinance_fundamentals),
+                            label="Rebuilding features",
+                        )
+                        if not ok:
+                            rank_blocked = True
+                        else:
+                            feat_path = _find_latest_features()
+                            ohlcv_path = _find_latest_ohlcv()
+                            # Re-detect latest asof
+                            if feat_path:
+                                auto_asof = _latest_rank_date(feat_path)
+                                if auto_asof:
+                                    rank_asof = auto_asof
+                    else:
+                        st.warning("No OHLCV data found after re-ingest.")
+                        rank_blocked = True
 
         # ── Rank ──────────────────────────────────────────────────────
-        if feat_path is None or not feat_path.exists():
+        if not rank_blocked:
+            feat_path = _find_latest_features()
+            model_path = _find_model(model_kind, rank_horizon, train_target)
+        if not rank_blocked and (feat_path is None or not feat_path.exists()):
             st.error("No features parquet found. Run the Pipeline tab first.")
-            st.stop()
-        if model_path is None:
-            st.error(f"Model not found: artifacts/models/{model_kind}_{rank_horizon}.joblib. Run Pipeline → Train.")
-            st.stop()
+            rank_blocked = True
+        if not rank_blocked and model_path is None:
+            _render_missing_model_help(model_kind, rank_horizon, train_target)
+            rank_blocked = True
+        if not rank_blocked:
+            if _model_is_legacy_path(model_path, model_kind, rank_horizon, train_target):
+                st.warning(
+                    f"Using legacy `{model_path.name}` — retrain to write "
+                    f"`{model_artifact_stem(model_kind, rank_horizon, train_target)}.joblib` "
+                    "so excess/sector models are not confused with raw."
+                )
 
-        ohlcv_path = _find_latest_ohlcv()
-        out_path = _rank_file_path(rank_horizon, rank_asof)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+            ohlcv_path = _find_latest_ohlcv()
+            out_path = _rank_file_path(rank_horizon, rank_asof)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        ltp_part = ""
-        if fetch_ltp and broker in {"yahoo", "angelone", "upstox", "zerodha"}:
-            ltp_broker = "yahoo" if broker == "yahoo" else broker
-            ltp_part = f" --live-ltp --ltp-broker {shlex.quote(ltp_broker)}"
-            if broker in {"zerodha", "angelone", "upstox"}:
-                ltp_part += _creds_flag()
+            ltp_part = ""
+            if fetch_ltp and broker in {"yahoo", "angelone", "upstox", "zerodha"}:
+                ltp_broker = "yahoo" if broker == "yahoo" else broker
+                ltp_part = f" --live-ltp --ltp-broker {shlex.quote(ltp_broker)}"
+                if broker in {"zerodha", "angelone", "upstox"}:
+                    ltp_part += _creds_flag()
 
-        ok = _run(
-            "python -m stock_knight.cli rank "
-            f"--features-parquet {shlex.quote(str(feat_path))} "
-            f"--ohlcv-parquet {shlex.quote(str(ohlcv_path))} "
-            f"--model-path {shlex.quote(str(model_path))} "
-            f"--asof {rank_asof} --horizon {rank_horizon} "
-            f"--training-target {train_target}"
-            + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
-            + ltp_part
-            + f" --out {shlex.quote(str(out_path))}"
-            + _rank_cmd_extras(feat_path),
-            label="Ranking stocks",
-        )
-        if ok:
-            st.session_state["last_rank_path"] = str(out_path)
-            st.success(f"Rankings updated for {rank_asof}")
+            ok = _run(
+                "python -m stock_knight.cli rank "
+                f"--features-parquet {shlex.quote(str(feat_path))} "
+                f"--ohlcv-parquet {shlex.quote(str(ohlcv_path))} "
+                f"--model-path {shlex.quote(str(model_path))} "
+                f"--asof {rank_asof} --horizon {rank_horizon} "
+                f"--rank-method {rank_sort_method} "
+                f"--training-target {train_target}"
+                + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
+                + ltp_part
+                + f" --out {shlex.quote(str(out_path))}"
+                + _rank_cmd_extras(feat_path)
+                + _yfinance_rank_extras(yfinance_fundamentals, data_root),
+                label="Ranking stocks",
+            )
+            if ok:
+                st.session_state["last_rank_path"] = str(out_path)
+                st.success(f"Rankings updated for {rank_asof}")
 
     # ── Load & display rank results ──────────────────────────────────────
     stored_path = st.session_state.get("last_rank_path")
@@ -868,14 +1103,16 @@ with tab_rank:
 
     payload = _load_rank(rank_path)
     if payload:
+        pred_is_fr_rank = bool(payload.get("prediction_is_fractional_return", True))
         # Metadata bar
-        meta1, meta2, meta3, meta4 = st.columns(4)
+        meta1, meta2, meta3, meta4, meta5 = st.columns(5)
         meta1.metric("Horizon", payload.get("horizon", "—").upper())
         effective_date = str(payload.get("asof", "—"))[:10]
         meta2.metric("Features as-of", effective_date)
         meta3.metric("Training Target", payload.get("training_target", "—"))
+        meta4.metric("Sort key", str(payload.get("rank_method", "—")).replace("_", " "))
         ltp_ts = payload.get("live_ltp_fetched_at")
-        meta4.metric("LTP Fetched", ltp_ts[:16] + " UTC" if ltp_ts else "Historical close only")
+        meta5.metric("LTP Fetched", ltp_ts[:16] + " UTC" if ltp_ts else "Historical close only")
 
         # ── Phase 4a: model-skill regime banner ───────────────────────────
         regime = (payload.get("regime_flag") or "unknown").lower()
@@ -944,14 +1181,18 @@ with tab_rank:
                 key="rank_risk_filter",
             )
         with f3:
-            pr_min, pr_max = st.slider(
-                "Predicted return range %",
-                min_value=-50.0,
-                max_value=50.0,
-                value=(-50.0, 50.0),
-                step=0.5,
-                key="rank_pr_range",
-            )
+            if pred_is_fr_rank:
+                pr_min, pr_max = st.slider(
+                    "Predicted return range %",
+                    min_value=-50.0,
+                    max_value=50.0,
+                    value=(-50.0, 50.0),
+                    step=0.5,
+                    key="rank_pr_range",
+                )
+            else:
+                st.caption("Return % filter applies to return-based models only.")
+                pr_min, pr_max = (-50.0, 50.0)
         with f4:
             custom_topk = st.number_input(
                 "Custom Top-K",
@@ -984,7 +1225,21 @@ with tab_rank:
             risk_filter=risk_filter,
             pr_min=pr_min,
             pr_max=pr_max,
+            apply_return_pct_filter=pred_is_fr_rank,
         )
+        fmt_cols = {
+            "Close (asof) ₹": "{:.2f}",
+            "Target Price ₹": "{:.2f}",
+            "Confidence %": "{:.1f}%",
+        }
+        if pred_is_fr_rank:
+            fmt_cols["Predicted Return %"] = "{:+.2f}%"
+        else:
+            fmt_cols["Model score"] = "{:.6f}"
+        if has_live:
+            fmt_cols["Live LTP ₹"] = "{:.2f}"
+        pr_style_col = "Predicted Return %" if pred_is_fr_rank else "Model score"
+
         if not top_df.empty:
             price_label = "📡 Live" if has_live else f"📅 Historical ({effective_date})"
             st.markdown(
@@ -992,22 +1247,13 @@ with tab_rank:
                 f"({rank_horizon.upper()}) | Price: {price_label}"
             )
 
-            fmt_cols = {
-                "Close (asof) ₹": "{:.2f}",
-                "Predicted Return %": "{:+.2f}%",
-                "Target Price ₹": "{:.2f}",
-                "Confidence %": "{:.1f}%",
-            }
-            if has_live:
-                fmt_cols["Live LTP ₹"] = "{:.2f}"
-
             cols_to_show = list(top_df.columns)
             if has_live and "Close (asof) ₹" in cols_to_show:
                 cols_to_show = [c for c in cols_to_show if c != "Close (asof) ₹"]
 
             styled = (
                 top_df[cols_to_show]
-                .style.map(_color_return, subset=["Predicted Return %"])
+                .style.map(_color_return, subset=[pr_style_col] if pr_style_col in cols_to_show else [])
                 .map(_color_reco, subset=["Reco"])
                 .format(
                     {k: v for k, v in fmt_cols.items() if k in cols_to_show},
@@ -1032,6 +1278,7 @@ with tab_rank:
                 risk_filter=risk_filter,
                 pr_min=pr_min,
                 pr_max=pr_max,
+                apply_return_pct_filter=pred_is_fr_rank,
             )
             if not bot_df.empty:
                 st.markdown(
@@ -1043,7 +1290,7 @@ with tab_rank:
                     cols_to_show = [c for c in cols_to_show if c != "Close (asof) ₹"]
                 styled_bot = (
                     bot_df[cols_to_show]
-                    .style.map(_color_return, subset=["Predicted Return %"])
+                    .style.map(_color_return, subset=[pr_style_col] if pr_style_col in cols_to_show else [])
                     .map(_color_reco, subset=["Reco"])
                     .format(
                         {k: v for k, v in fmt_cols.items() if k in cols_to_show},
@@ -1119,6 +1366,7 @@ with tab_detail:
                 st.metric("Rank", f"{rank_idx} / {len(ranked_syms)}")
 
             row = row_map.get(sel_symbol, {})
+            detail_pred_is_fr = bool(detail_payload.get("prediction_is_fractional_return", True))
 
             # ── Headline cards ────────────────────────────────────────────
             card_cols = st.columns(5)
@@ -1129,9 +1377,15 @@ with tab_detail:
             conf = row.get("confidence_pct")
 
             card_cols[0].metric("Price ₹", f"{ltp:,.2f}" if ltp else "—")
+            tgt_delta = None
+            if detail_pred_is_fr and pr is not None:
+                tgt_delta = f"{float(pr) * 100:+.2f}%"
+            elif not detail_pred_is_fr and pr is not None:
+                tgt_delta = f"score {float(pr):+.4f}"
             card_cols[1].metric(
                 "Target ₹", f"{target:,.2f}" if target else "—",
-                delta=(f"{pr * 100:+.2f}%" if pr is not None else None),
+                delta=tgt_delta,
+                help=None if detail_pred_is_fr else "Target price not derived for rank-score models (lgbm_rank / ensemble).",
             )
             card_cols[2].metric(
                 "Recommendation", reco,
@@ -1332,7 +1586,7 @@ with tab_pipeline:
     feat_path = _find_latest_features()
     ohlcv_path = _find_latest_ohlcv()
     models_exist = {
-        h: (Path("artifacts") / "models" / f"{model_kind}_{h}.joblib").exists()
+        h: _model_file_exists_for_ui(model_kind, h, train_target)
         for h in ["1d", "7d", "1m", "6m", "12m"]
     }
 
@@ -1342,12 +1596,26 @@ with tab_pipeline:
     trained = [h for h, v in models_exist.items() if v]
     s3.metric("Models", f"✅ {len(trained)}/5" if trained else "❌ None", delta=", ".join(trained) if trained else "run Train")
 
+    # Expander defaults: when everything looks done, all flags below were False — the tab looked "empty"
+    # (only metrics + four collapsed bars). Open Step 4 for rank; otherwise open the first blocked step.
+    expand_step1 = not bool(ohlcv_path)
+    expand_step2 = bool(ohlcv_path) and not bool(feat_path)
+    expand_step3 = bool(feat_path) and not any(models_exist.values())
+    expand_step4 = False
+    if not expand_step1 and not expand_step2 and not expand_step3:
+        st.info(
+            "✅ **Ingest, features, and training** look complete for the current sidebar **Model** and "
+            "**Training target**. Expand **Step 1–4** below to re-run any part of the pipeline, or use the "
+            "**📊 Rankings** tab for daily updates."
+        )
+        expand_step4 = True
+
     st.divider()
 
     syms_file = _resolve_symbols_file()
 
     # ── Step 1: Ingest ────────────────────────────────────────────────────
-    with st.expander("Step 1 — Ingest EOD data", expanded=not bool(ohlcv_path)):
+    with st.expander("Step 1 — Ingest EOD data", expanded=expand_step1):
         st.write(f"Fetches daily OHLCV from **{broker}** for all symbols in `{syms_file or 'symbols.txt'}`.")
         p_start = st.date_input("From", value=start, key="pipe_start")
         p_end = st.date_input("To", value=end, key="pipe_end")
@@ -1417,7 +1685,7 @@ with tab_pipeline:
                 st.success("Training complete. Models saved in `artifacts/models/`")
 
     # ── Step 4: Rank ──────────────────────────────────────────────────────
-    with st.expander("Step 4 — Generate rank file", expanded=False):
+    with st.expander("Step 4 — Generate rank file", expanded=expand_step4):
         feat_path = _find_latest_features()
         ohlcv_path = _find_latest_ohlcv()
         pipe_horizon = st.selectbox("Horizon", ["1d", "7d", "1m", "6m", "12m"], index=1, key="pipe_horizon")
@@ -1430,10 +1698,15 @@ with tab_pipeline:
             if not feat_path:
                 st.error("No features data found.")
                 st.stop()
-            model_path = _find_model(model_kind, pipe_horizon)
+            model_path = _find_model(model_kind, pipe_horizon, train_target)
+            expect = model_artifact_stem(model_kind, pipe_horizon, train_target)
             if not model_path:
-                st.error(f"Model not found for horizon={pipe_horizon}. Run Step 3.")
+                _render_missing_model_help(model_kind, pipe_horizon, train_target)
                 st.stop()
+            if _model_is_legacy_path(model_path, model_kind, pipe_horizon, train_target):
+                st.warning(
+                    f"Using legacy `{model_path.name}` — retrain to write `{expect}.joblib`."
+                )
             out_path = _rank_file_path(pipe_horizon, pipe_asof)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             ltp_part = ""
@@ -1452,7 +1725,8 @@ with tab_pipeline:
                 + (f" --benchmark-symbol {shlex.quote(benchmark_symbol)}" if train_target == "excess" and benchmark_symbol.strip() else "")
                 + ltp_part
                 + f" --out {shlex.quote(str(out_path))}"
-                + _rank_cmd_extras(feat_path),
+                + _rank_cmd_extras(feat_path)
+                + _yfinance_rank_extras(yfinance_fundamentals, data_root),
                 label="Ranking",
             )
             if ok:

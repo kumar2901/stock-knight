@@ -33,6 +33,10 @@ class TrainedModel:
     model: object  # for "ensemble" this is dict[ModelKind, object]
     member_kinds: list[str] = field(default_factory=list)  # only for ensembles
 
+    def predictions_are_fractional_returns(self) -> bool:
+        """True if ``predict()`` is in forward-return units (e.g. 0.02 ⇒ +2%)."""
+        return self.kind not in ("lgbm_rank", "ensemble")
+
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         if self.kind == "ridge":
             return self.model.predict(X[self.feature_cols].to_numpy())
